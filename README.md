@@ -2,7 +2,7 @@
 
 Umbra Starless is an AI star remover for [Siril](https://siril.org). It works on linear or stretched images. It is a Siril Python script with an AI model. It runs locally on your computer and is free. It removes stars and their halos and fills the holes, and it can give you the star layer on its own.
 
-**Status: Beta (v0.2.0).** Expect rough edges.
+**Status: Beta (v0.2.1).** Expect rough edges.
 
 ![Umbra Starless panel](docs/screenshots/Umbra_Starless_panel.png)
 
@@ -115,7 +115,7 @@ Small images: the model uses fixed 512 px tiles, so images under 512 px are padd
 
 ## Layout
 
-- `Umbra_Starless.py`: the script (v0.2.0, ONNX Runtime, with model download and update check)
+- `Umbra_Starless.py`: the script (v0.2.1, ONNX Runtime, with model download and update check)
 - `models/models.json`: model manifest (name, version, download URL, SHA-256, size)
 - `docs/screenshots/`: panel and editor screenshots
 - `LICENSE`, `LICENSE-MODELS.md`: licenses
