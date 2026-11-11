@@ -6,7 +6,6 @@ Umbra Starless is an AI star remover for [Siril](https://siril.org). It works on
 
 ![Umbra Starless panel](docs/screenshots/Umbra_Starless_panel.png)
 
-![Umbra Starless editor with correction marks](docs/screenshots/Umbra_Starless_editor.png)
 
 ![Umbra Starless panel](docs/screenshots/Umbra_Starless_panel_updnote.png)
 
