@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
 # Umbra Starless (BETA), Copyright (c) 2026 Kishan Patel. Own code; no code taken from other scripts.
-"""AI star remover for linear or stretched images. Preview or Apply; Apply replaces the image in Siril (Undo available).
+"""AI star remover for linear or stretched images. Preview opens an editor on the whole image; Apply replaces the image in Siril (Undo available).
 Star removal 100% removes the stars, lower values only reduce them. Output can be the starless image or the star layer.
+Correction marks (Remove / Keep brushes) and the optional Auto-keep are in the Preview window; Auto-keep needs its own small model (Download model).
 Run in Siril (Scripts menu), or standalone:
-  python Umbra_Starless.py --image in.fits --out out.fits [--model PATH.onnx] [--removal 0..1] [--data auto|linear|stretched] [--output starless|stars] [--stars-out stars.fits]
+  python Umbra_Starless.py --image in.fits --out out.fits [--model PATH.onnx] [--removal 0..1] [--data auto|linear|stretched] [--output starless|stars] [--stars-out stars.fits] [--auto-keep] [--remove-marks MAP.fits] [--keep-marks MAP.fits]
   python Umbra_Starless.py --ui-test        (opens the window on a fake image, runs Preview once, exits)
   python Umbra_Starless.py --check-updates | --download [MODEL_ID|all]"""
-VERSION = '0.1.1'
+VERSION = '0.2.0'
+# 0.2.0: correction marks (Remove / Keep / Eraser brushes) and Auto-keep are back, with the live editor; GPU by default also on Linux with NVIDIA (CUDA libraries installed on first run if missing); OpenVINO / MIGraphX used when installed; half-size model files with identical results.
 # 0.1.1: buttons, check boxes, drop-down menus and scroll bars now look the same as in Umbra Astro Studio.
-# 0.1.0: First family release (ONNX Runtime, no PyTorch): one-button Preview / Apply flow (the correction marks and Auto-keep of the old script are not in this release).
+# 0.1.0: First family release (ONNX Runtime, no PyTorch): one-button Preview / Apply flow.
 # ============================================================================================ shared code (src/common.py)
 # Everything the five scripts share: dependency install, ONNX Runtime sessions, updater, preferences, Siril I/O, family UI, CLI.
 import sys, os, json, hashlib, argparse, time, math, re, types
@@ -20,15 +22,26 @@ if __name__ == '__main__' and not _STANDALONE and '--help' not in sys.argv and '
     def _ort_requirement():
         """onnxruntime variant for this machine (all variants import as 'onnxruntime'; only one may be installed). An existing one is kept."""
         import importlib.metadata as _md, platform as _pf, shutil as _sh
-        for n in ('onnxruntime-gpu', 'onnxruntime-directml', 'onnxruntime-rocm', 'onnxruntime'):
+        for n in ('onnxruntime-gpu', 'onnxruntime-directml', 'onnxruntime-rocm', 'onnxruntime-migraphx', 'onnxruntime-openvino', 'onnxruntime'):
             try:
                 _md.version(n); return n
             except Exception:
                 pass
-        if _pf.system() == 'Windows': return 'onnxruntime-directml'          # GPU through DirectX 12 (NVIDIA / AMD / Intel); CUDA needs onnxruntime-gpu
-        if _pf.system() == 'Linux' and _sh.which('nvidia-smi'): return 'onnxruntime-gpu'   # needs the CUDA 12 + cuDNN 9 libraries; falls back to CPU without them
+        if _pf.system() == 'Windows': return 'onnxruntime-directml'          # GPU through DirectX 12 (NVIDIA / AMD / Intel), no extra downloads
+        if _pf.system() == 'Linux' and _sh.which('nvidia-smi'): return 'onnxruntime-gpu'   # CUDA; the CUDA 12 / cuDNN 9 libraries are installed below if missing
         return 'onnxruntime'                                                   # macOS: Core ML is built in; Linux without NVIDIA: CPU
-    _siril_deps.ensure_installed('numpy', _ort_requirement(), 'PyQt6', 'scipy', 'astropy')
+    _ORT_PKG = _ort_requirement()
+    _siril_deps.ensure_installed('numpy', _ORT_PKG, 'PyQt6', 'scipy', 'astropy')
+    if _ORT_PKG == 'onnxruntime-gpu':
+        # GPU by default on NVIDIA: if the system has no CUDA 12 / cuDNN 9 libraries, install NVIDIA's pip packages of them
+        # (onnxruntime loads them with preload_dlls()).  Large one-time download (about 2-3 GB); CPU fallback if anything fails.
+        import ctypes.util as _cu
+        if not _cu.find_library('cudnn'):
+            try:
+                _siril_deps.ensure_installed('nvidia-cuda-runtime-cu12', 'nvidia-cublas-cu12', 'nvidia-cudnn-cu12', 'nvidia-cufft-cu12',
+                                             'nvidia-curand-cu12', 'nvidia-cuda-nvrtc-cu12')
+            except Exception as _e:
+                print(f'Could not install the CUDA libraries ({_e}); the script will use the CPU.', flush=True)
 import numpy as np
 import urllib.request
 
@@ -53,6 +66,8 @@ class ToolSpec:
         self.reuse_preview = False       # Gradient: Apply with unchanged settings reuses the preview result
         self.alt = None                  # (button text, info key) second preview layer
         self.progress_unit = 'tile'
+        self.extras = {}                 # extra model files: kind -> file stem prefix (e.g. {'critic': 'umbra_starless_critic'}); not shown in the model picker
+        self.has_editor = False          # Starless: Preview opens the correction-marks editor
         self.__dict__.update(kw)
 
     @property
@@ -80,6 +95,11 @@ class ToolSpec:
         pass
     def post_cli(self, a, dst, info, header, label):
         return ''
+    def prepare_job(self, view, job):
+        """GUI thread, before a run starts: whatever the run needs from the window (snapshot).  Handed to engine_run as `extra`."""
+        return None
+    def engine_run(self, eng, data, params, progress, cancel, extra):
+        return eng.run(data, params, progress=progress, cancel=cancel)
 
 
 def env(spec, name, default=None):
@@ -122,8 +142,28 @@ def model_label(spec, stem):
     return spec.labels.get(stem) or _MANIFEST_NAMES.get((spec.key, stem)) or stem
 
 
+def is_extra(spec, name):
+    """True for a file of an extra kind (e.g. the Auto-keep critic): it is a model file, but never offered as a model."""
+    stem = Path(str(name)).stem
+    return any(stem.startswith(pre) for pre in spec.extras.values())
+
+
+def extra_path(spec, kind):
+    """Newest installed file of an extra kind (e.g. 'critic') in the models folder, or None.  <PREFIX><KIND>_MODEL overrides."""
+    e = env(spec, kind.upper() + '_MODEL')
+    if e:
+        return e if Path(e).is_file() else None
+    pre = spec.extras.get(kind)
+    if not pre:
+        return None
+    files = [f for f in _onnx_files(download_dir(spec)) if f.stem.startswith(pre)]
+    if not files:
+        files = [f for f in _onnx_files(model_dir(spec)[0]) if f.stem.startswith(pre)]
+    return str(sorted(files, key=lambda f: (_version_tuple(f.stem.rsplit('_v', 1)[-1].replace('_experimental', '')) or (0,), f.name))[-1]) if files else None
+
+
 def list_models(spec):
-    items = [(model_label(spec, f.stem), str(f)) for f in _onnx_files(model_dir(spec)[0])]
+    items = [(model_label(spec, f.stem), str(f)) for f in _onnx_files(model_dir(spec)[0]) if not is_extra(spec, f)]
     items.sort(key=lambda it: (0 if Path(it[1]).stem in spec.default_stems else 1, it[0]))
     return items
 
@@ -217,9 +257,9 @@ def import_engine(spec):
         raise RuntimeError(_IMPORT_ERROR['msg']) from e
 
 
-def make_session_factory(prefix):
+def make_session_factory(prefix, skip=()):
     """-> factory(model_path, feed) -> (run_fn, provider_label, note).  run_fn(feed_dict) -> list of outputs (like sess.run(None, feed)).
-    GPU providers are tried in order of preference for the platform (CUDA, DirectML, ROCm, Core ML); each is checked against the CPU
+    GPU providers are tried in order of preference for the platform (CUDA, DirectML, ROCm, MIGraphX, OpenVINO, Core ML); each is checked against the CPU
     provider on one probe feed (outputs must agree to 1e-3 relative) and the first that works is used. Anything missing, failing or
     disagreeing falls through to the next, and finally to the CPU.  <PREFIX>CPU=1 forces the CPU."""
     def factory(model_path, feed):
@@ -235,13 +275,20 @@ def make_session_factory(prefix):
         sess, label = None, 'CPU'
         if not os.environ.get(prefix + 'CPU'):
             avail = ort.get_available_providers()
+            if 'CUDAExecutionProvider' in avail and hasattr(ort, 'preload_dlls'):
+                try:
+                    ort.preload_dlls()          # CUDA / cuDNN from NVIDIA's pip packages, when the system has none
+                except Exception:
+                    pass
             cands = [('CUDAExecutionProvider', 'CUDA', {'use_tf32': '0', 'cudnn_conv_algo_search': 'HEURISTIC'}, False),
                      ('DmlExecutionProvider', 'DirectML', {}, True),
                      ('ROCMExecutionProvider', 'ROCm', {}, False),
+                     ('MIGraphXExecutionProvider', 'MIGraphX', {}, False),
+                     ('OpenVINOExecutionProvider', 'OpenVINO', {'device_type': 'GPU'}, False),
                      ('CoreMLExecutionProvider', 'Core ML', {'ModelFormat': 'MLProgram', 'MLComputeUnits': 'CPUAndGPU'}, False)]
             notes = []
             for name, lab, opts, dml in cands:
-                if name not in avail:
+                if name not in avail or lab in skip:
                     continue
                 try:
                     so2 = ort.SessionOptions(); so2.log_severity_level = 3
@@ -280,7 +327,8 @@ def get_engine(spec, model_path):
     p = Path(str(model_path or ''))
     if not p.is_file():
         raise FileNotFoundError(f'Model not found: {p}')
-    eng = ENGINES[spec.key].Engine(str(p), make_session_factory(spec.prefix))
+    kw = {'critic_factory': make_session_factory(spec.prefix, skip=('Core ML',))} if spec.extras else {}   # the critic has free tile shapes: Core ML is slow there, the CPU takes about 1 s per 1024 px tile
+    eng = ENGINES[spec.key].Engine(str(p), make_session_factory(spec.prefix), **kw)
     _ENGINE_CACHE[spec.key] = (str(p), eng)
     return eng
 
@@ -368,7 +416,8 @@ def _valid_entry(m, upd):
     try:
         f = m['file']
         return (re.fullmatch(r'[A-Za-z0-9._-]{1,120}\.onnx', f) is not None and '..' not in f and _valid_model_url(m['url'], f, upd)
-                and re.fullmatch(r'[0-9a-f]{64}', str(m['sha256']).lower()) is not None and int(m['size_bytes']) > 0 and bool(m.get('name')))
+                and re.fullmatch(r'[0-9a-f]{64}', str(m['sha256']).lower()) is not None and int(m['size_bytes']) > 0 and bool(m.get('name'))
+                and re.fullmatch(r'[a-z]{1,20}', str(m.get('kind', 'model'))) is not None)
     except Exception:
         return False
 
@@ -427,7 +476,9 @@ def model_state(entry, folder):
     p = Path(folder) / entry['file']
     if not p.is_file():
         return 'missing'
-    return 'current' if file_sha256(p) == entry['sha256'] else 'update'
+    # alt_sha256: older files that give identical results (e.g. the same weights stored at full size), so they are not re-downloaded
+    ok = {entry['sha256']} | {str(h).lower() for h in (entry.get('alt_sha256') or []) if isinstance(h, str)}
+    return 'current' if file_sha256(p) in ok else 'update'
 
 
 def entries_for(manifest, tool=None):
@@ -512,7 +563,7 @@ def describe_updates(res, spec):
 def missing_model_message(spec, res=None):
     """Status text when no model is installed."""
     if res:
-        d = next((m for m, st in res['models'] if st == 'missing' and m.get('default')), None) or next((m for m, st in res['models'] if st == 'missing'), None)
+        d = next((m for m, st in res['models'] if st == 'missing' and m.get('default') and not m.get('kind')), None) or next((m for m, st in res['models'] if st == 'missing' and not m.get('kind')), None)
         if d:
             return f"No model installed. Press Download model to get {d['name']} ({d['size_bytes'] / 1e6:.0f} MB)."
     return f'No model installed. Press Download model, or put a .onnx file in {model_dir(spec)[0]}.'
@@ -807,9 +858,9 @@ def _qt():
         prog = pyqtSignal(int, int)
         stage = pyqtSignal(str)
 
-        def __init__(self, spec, model_path, data, params):
+        def __init__(self, spec, model_path, data, params, extra=None):
             super().__init__()
-            self.spec, self.model_path, self.data, self.params = spec, model_path, data, params
+            self.spec, self.model_path, self.data, self.params, self.extra = spec, model_path, data, params, extra
             self.cancel_flag = False
 
         def run(self):
@@ -821,7 +872,7 @@ def _qt():
                 eng = get_engine(self.spec, self.model_path)
                 loading = False
                 self.stage.emit('Running…')
-                out, info = eng.run(self.data, self.params, progress=lambda n, t: self.prog.emit(int(n), int(t)), cancel=lambda: self.cancel_flag)
+                out, info = self.spec.engine_run(eng, self.data, self.params, lambda n, t: self.prog.emit(int(n), int(t)), lambda: self.cancel_flag, self.extra)
                 self.done.emit(out, info, time.time() - t0, eng.provider, eng.note)
             except Exception as e:
                 if not loading and str(e) == 'Cancelled':
@@ -1213,6 +1264,11 @@ def _qt():
                 return download_model(entry, self.upd, download_dir(self.spec), progress=prog)
             def done(path):
                 self.info = None
+                if entry.get('kind'):               # an extra file (e.g. the Auto-keep model): not a model for the picker
+                    self.dl_btn.setStyleSheet('' if self.model_path() else self.dl_btn.styleSheet())
+                    getattr(self.panel, 'extras_changed', lambda: None)()
+                    self.set_status(f"Installed {entry['name']}. " + self.idle_msg)
+                    return
                 self.refresh_models(select=str(path))
                 self.set_status(f"Installed {entry['name']}. " + self.idle_msg)
             self.run_net(work, done, f"Downloading {entry['name']}…")
@@ -1222,6 +1278,9 @@ def _qt():
             if self.worker is not None and self.worker.isRunning():
                 self.worker.cancel_flag = True
                 self.cancel_btn.setEnabled(False)
+            hook = getattr(self.panel, 'cancel', None)
+            if hook is not None:
+                hook()
 
         def read_image(self, kind):
             """-> (data, meta, identity, header_text, region note, rect)"""
@@ -1239,6 +1298,9 @@ def _qt():
         def start(self, kind):
             if self.busy:
                 return
+            if getattr(self.panel, 'editor_busy', lambda: False)():
+                self.set_status('The preview window is still working. Wait until it has finished.')
+                return
             sp = self.spec
             path = self.model_path()
             if not path:
@@ -1251,6 +1313,10 @@ def _qt():
                 return
             params = dict(self.panel.params())
             params.update(sp.image_params(htxt))
+            if kind == 'preview' and sp.has_editor:
+                self.save_prefs()
+                self.panel.open_editor(self, data, meta, identity, params, path)
+                return
             rect, region, crop = None, 'whole image', None
             full = data
             if kind == 'preview':
@@ -1290,12 +1356,17 @@ def _qt():
                     else:
                         print(msg, flush=True)
             self.job = dict(kind=kind, meta=meta, identity=identity, params=params, region=region, data=data, key=key, htxt=htxt, rect=rect, crop=crop)
+            try:
+                extra = sp.prepare_job(self, self.job)
+            except Exception as e:
+                self.set_status(str(e), True)
+                return
             self.result = None; self.last_error = None
             self.save_prefs()
             self.set_busy(True)
             self.cancel_btn.setEnabled(True)
             self.set_status('Loading model…' if str(path) not in [c[0] for c in _ENGINE_CACHE.values()] else 'Running…')
-            self.worker = Worker(sp, path, data, params)
+            self.worker = Worker(sp, path, data, params, extra)
             self.worker.stage.connect(self.set_status)
             self.worker.prog.connect(self.on_progress)
             self.worker.done.connect(self.finish)
@@ -1379,6 +1450,7 @@ def _qt():
                     t.wait(8000)
             if self.preview is not None:
                 self.preview.close()
+            getattr(self.panel, 'shutdown', lambda: None)()
 
     class MainWindow(QWidget):
         def __init__(self, specs, combined, siril=None, fake_image=None, smoke=False):
@@ -1459,7 +1531,7 @@ def _qt():
             super().closeEvent(e)
 
     _QT['ns'] = types.SimpleNamespace(**{k: v for k, v in locals().items() if k in (
-        'Worker', 'Task', 'PreviewWindow', 'Ui', 'ToolView', 'MainWindow', 'QApplication', 'QTimer')})
+        'Worker', 'Task', 'PreviewWindow', 'Ui', 'ToolView', 'MainWindow', 'QApplication', 'QTimer', 'ModernComboBox', 'qimage')})
     return _QT['ns']
 
 
@@ -1497,6 +1569,9 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
             return
         pre = f'Umbra_Astro_AI_{key}' if combined else win.view().spec.script
         win.grab().save(str(outdir / f'{pre}_panel.png'))
+        ed = getattr(v.panel, 'ed', None)
+        if ed is not None and ed.isVisible():
+            ed.grab().save(str(outdir / f'{pre}_editor.png'))
         if v.preview is not None and v.preview.isVisible():
             v.preview.grab().save(str(outdir / f'{pre}_preview.png'))
             if v.preview.alt_btn is not None and v.preview.alt_btn.isVisible():
@@ -1530,8 +1605,16 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
         if v.busy and time.time() - state['t0'] < 900:
             q.QTimer.singleShot(250, lambda: poll(v, key))
             return
-        ok = v.last_error is None and v.result is not None and bool(np.isfinite(v.result).all()) and v.last_preview is not None
-        if ok:
+        ed = getattr(v.panel, 'ed', None)
+        if v.spec.has_editor:
+            ed.wait_idle()
+            ok = ed.res is not None and bool(np.isfinite(ed.res['out']).all()) and not v.busy
+            if ok:
+                ed.orig_btn.pressed.emit(); ok &= ed.holding; ed.orig_btn.released.emit(); ok &= not ed.holding
+                v.status.setText(f'Editor: Remove Stars {ed.timings.get("remove", 0):.1f} s, {ed.shape[1]}x{ed.shape[0]} px.')
+        else:
+            ok = v.last_error is None and v.result is not None and bool(np.isfinite(v.result).all()) and v.last_preview is not None
+        if ok and not v.spec.has_editor:
             v.preview.orig_btn.pressed.emit(); ok &= v.preview.current_key() == 'before'; v.preview.orig_btn.released.emit(); ok &= v.preview.current_key() == 'after'
         print(f'UI TEST {key}: {"OK" if ok else "FAILED"} {v.status.text()}', flush=True)
         state['ok'] &= ok
@@ -1539,6 +1622,8 @@ def run_app(specs, combined, siril=None, fake=None, smoke=False, shots=None):
         snap(v, key)
         if v.preview is not None:
             v.preview.close()
+        if ed is not None:
+            ed.shutdown()
         state['i'] += 1
         q.QTimer.singleShot(50, next_tool)
     q.QTimer.singleShot(100, next_tool)
@@ -1575,7 +1660,7 @@ def run_file(spec, a):
         raise SystemExit(f'No model installed. Run with --download, or put a .onnx file in {model_dir(spec)[0]}.')
     t0 = time.time()
     eng = get_engine(spec, path)
-    out, info = eng.run(data, params, progress=None, cancel=None)
+    out, info = spec.engine_run(eng, data, params, None, None, None)
     label = f"{spec.name} {VERSION} {spec.label(params)}"
     write_out = spec.output(params, out, info)
     for k in ('BSCALE', 'BZERO', 'BLANK'):
@@ -1678,17 +1763,30 @@ def _engine_starless():
       5. star layer K: linear  x - S;  stretched  unscreen 1 - (1 - x) / (1 - S)  (so S + K, or screen(S, K), gives back x)
       6. Reduce Stars: amount 1 = S exactly, 0 = x exactly, between = star layer un-stretched by one smooth curve (stars shrink)
 
-    NOT included (not part of the published version): correction marks (Remove / Keep painting) and the Auto-keep critic.
+    Correction marks and Auto-keep (v0.0.4 behaviour):
+      Remove marks  a (H,W) map in [0,1] fed to the network's cond input; the network re-runs ONLY on the tiles the marks touch, the result is
+                    blended in with an 8 px feather and noise-filled locally (remove_marks)
+      Keep marks    a (H,W) map in [0,1]; the original is put back there (feathered 4 px) in the result and in the star layer (finish)
+      Auto-keep     a small critic network (separate ONNX file) finds non-star structure (nebula, dust-lane edges, galaxy knots) in the star layer
+                    and puts it back into the starless image, never over star cores (auto_keep_mask)
+    Two stages for an interactive editor: state = Engine.remove(...) runs the network once; Engine.remove_marks(state, mask), Engine.set_auto_keep
+    and Engine.finish(state, amount, mask_keep, output) reuse the cached state.  Engine.run() == remove + remove_marks + finish.
     NaN pixels: filled from the nearest valid pixel before processing, restored to NaN in every output.
 
     params (all optional):
       amount  float 0..1, default 1.0   1 = full star removal, <1 = reduce stars, 0 = original
       mode    'auto' | 'linear' | 'stretched', default 'auto'
       output  'starless' | 'stars', default 'starless'   ('stars' returns the star layer as the image)
+      mask_remove  (H,W) float32 in [0,1] or None (array row order of `data`), as painted (feathered inside the engine)
+      mask_keep    (H,W) float32 in [0,1] or None, as painted (feathered inside the engine)
+      auto_keep    bool, default False; needs critic_model_path (the critic .onnx)
+      critic_model_path  path of the critic model
     info: {'notes': [str], 'stars': star layer (same shape/dtype as data, NaN where data is NaN), 'mode_used': 'linear'|'stretched',
-           'sigma': global noise sigma}
+           'sigma': global noise sigma, 'state': the cached state (only when params['return_state'])}
     """
     import math
+    import copy
+    import hashlib
     import numpy as np
 
     TOOL = 'starless'
@@ -1698,6 +1796,10 @@ def _engine_starless():
     HALO_FACTOR = 4
     A_SPAN = 1.5
     FADE0 = 0.8
+    CRITIC_TILE = 1024
+    CRITIC_OVERLAP = 48
+    FOOT_FRAC = 0.05
+    RING = 1.4
 
 
     def probe_feed():
@@ -1835,10 +1937,13 @@ def _engine_starless():
     _PAD_FILL = {'mode': 'reflect'}
 
 
-    def _pad_tile(a, ph, pw):
-        """Pad a (3,h,w) tile to 512 x 512.  First reflect up to a multiple of 32 (what the torch script does), then fill the rest."""
+    def _pad_tile(a, ph, pw, cond=False):
+        """Pad a (3,h,w) tile to 512 x 512.  First reflect up to a multiple of 32 (what the torch script does), then fill the rest.
+        cond=True (the Remove-mark map): zeros instead."""
         h, w = a.shape[-2:]
         p32h, p32w = (-h) % 32, (-w) % 32
+        if cond:
+            return np.pad(a, ((0, 0), (0, ph), (0, pw)))
         if p32h or p32w:
             a = np.pad(a, ((0, 0), (0, p32h), (0, p32w)), mode='reflect')
         rh, rw = ph - p32h, pw - p32w
@@ -1848,35 +1953,51 @@ def _engine_starless():
         return a
 
 
-    def _starless_core(run_fn, x, tick, tile=TILE, overlap=OVERLAP):
-        """x: (3,H,W) float32 -> (S in x's units, global noise sigma).  Tiled, cosine-blended overlap."""
+    def _starless_core(run_fn, x, tick, tile=TILE, overlap=OVERLAP, mask=None, region=None, stats=None, stats_out=None):
+        """x: (3,H,W) float32 -> (S in x's units, global noise sigma).  Tiled, cosine-blended overlap.
+        mask: (H,W) force-remove map in [0,1] (network cond input) or None.  region=(y0,y1,x0,x1): only the tiles touching it are run
+        (zeros elsewhere, the caller blends).  stats: precomputed image_stats(x)."""
         C, H, W = x.shape
         xt = np.ascontiguousarray(np.nan_to_num(x), np.float32)
-        m, s = image_stats(xt)
+        m, s = image_stats(xt) if stats is None else stats
+        if stats_out is not None:
+            stats_out['stats'] = (m, s)
         xc = _compress((xt - m[:, None, None]) / s[:, None, None])
         step = tile - 2 * overlap
-        ys = range(0, max(H - 2 * overlap, 1), step); xs = range(0, max(W - 2 * overlap, 1), step)
+        ys = list(range(0, max(H - 2 * overlap, 1), step)); xs = list(range(0, max(W - 2 * overlap, 1), step))
         acc = np.zeros((3, H, W), np.float32); wacc = np.zeros((1, H, W), np.float32)
         ramp = (0.5 - 0.5 * np.cos(np.linspace(0, math.pi, overlap + 2, dtype=np.float32)[1:-1])).astype(np.float32)
         w1 = np.ones(tile, np.float32); w1[:overlap] = ramp; w1[-overlap:] = ramp[::-1]
         wt = (w1[:, None] * w1[None, :])[None]
-        for y in ys:
-            for x_ in xs:
-                y0, x0 = min(y, max(H - tile, 0)), min(x_, max(W - tile, 0))
-                a = xc[:, y0:y0 + tile, x0:x0 + tile]
-                h, w = a.shape[-2:]
-                ph, pw = tile - h, tile - w                  # the ONNX models are fixed at 512 x 512: always run exactly one full tile
-                if ph or pw:
-                    a = _pad_tile(a, ph, pw)
-                feed = {'x': np.ascontiguousarray(a[None], np.float32), 'cond': np.zeros((1, 1, tile, tile), np.float32)}
-                r = np.asarray(run_fn(feed)[0], np.float32)[0][:, :h, :w]
-                z = _decompress(a[:, :h, :w] + r)
-                ww = wt[:, :h, :w]
-                acc[:, y0:y0 + h, x0:x0 + w] += z * ww
-                wacc[:, y0:y0 + h, x0:x0 + w] += ww
-                tick()
+        jobs = [(y, x_) for y in ys for x_ in xs]
+        if region is not None:
+            ry0, ry1, rx0, rx1 = region
+            jobs = [(y, x_) for y, x_ in jobs if y < ry1 and y + tile > ry0 and x_ < rx1 and x_ + tile > rx0]
+        mk = None if mask is None else np.ascontiguousarray(mask, np.float32)[None]
+        for y, x_ in jobs:
+            y0, x0 = min(y, max(H - tile, 0)), min(x_, max(W - tile, 0))
+            a = xc[:, y0:y0 + tile, x0:x0 + tile]
+            h, w = a.shape[-2:]
+            ph, pw = tile - h, tile - w                  # the ONNX models are fixed at 512 x 512: always run exactly one full tile
+            if ph or pw:
+                a = _pad_tile(a, ph, pw)
+            if mk is None:
+                cond = np.zeros((1, 1, tile, tile), np.float32)
+            else:
+                b = mk[:, y0:y0 + h, x0:x0 + w]
+                cond = np.ascontiguousarray(_pad_tile(b, tile - h, tile - w, cond=True)[None], np.float32)
+            feed = {'x': np.ascontiguousarray(a[None], np.float32), 'cond': cond}
+            r = np.asarray(run_fn(feed)[0], np.float32)[0][:, :h, :w]
+            z = _decompress(a[:, :h, :w] + r)
+            ww = wt[:, :h, :w]
+            acc[:, y0:y0 + h, x0:x0 + w] += z * ww
+            wacc[:, y0:y0 + h, x0:x0 + w] += ww
+            tick()
         zn = acc / np.maximum(wacc, 1e-6)
-        return (zn * s[:, None, None] + m[:, None, None]).astype(np.float32), float(s.mean())
+        out = (zn * s[:, None, None] + m[:, None, None]).astype(np.float32)
+        if region is not None:
+            out = np.where(wacc > 1e-6, out, 0).astype(np.float32)
+        return out, float(s.mean())
 
 
     def _large_halos(run_fn, x, tick, factor=HALO_FACTOR):
@@ -1911,10 +2032,15 @@ def _engine_starless():
         return _gblur(out, factor / 2).astype(np.float32)
 
 
-    def _starless(run_fn, x, tick):
-        """halo pass, then the network at full resolution on x - halo.  Returns (S, sigma)."""
+    def _starless(run_fn, x, tick, keep=None):
+        """halo pass, then the network at full resolution on x - halo.  Returns (S, sigma).  keep (dict): receives 'halo' (None when it is
+        all zero) and 'stats' for later Remove-mark re-runs."""
         Hh = _large_halos(run_fn, x, tick)
-        S, sg = _starless_core(run_fn, x - Hh, tick)
+        so = {}
+        S, sg = _starless_core(run_fn, x - Hh, tick, stats_out=so)
+        if keep is not None:
+            keep['halo'] = Hh if Hh.any() else None
+            keep['stats'] = so['stats']
         return np.minimum(S, x), sg
 
 
@@ -2033,21 +2159,234 @@ def _engine_starless():
         return np.minimum(np.maximum(_Ti(tO, b, mm), S), X).astype(np.float32)
 
 
-    # ------------------------------------------------------------------------------------------------ engine
-    class Engine:
-        def __init__(self, model_path, session_factory):
-            self.model_path = model_path
-            self._run, self.provider, self.note = session_factory(model_path, probe_feed())
+    # ------------------------------------------------------------------------------------------------ marks and Auto-keep (ust/infer.py)
+    def feather(mask, px=6.0):
+        return np.clip(_gblur(np.asarray(mask, np.float32), px), 0, 1)
 
-        def run(self, data, params=None, progress=None, cancel=None):
+
+    def apply_keep(x, S, mk):
+        return (S * (1 - mk[None]) + x * mk[None]).astype(np.float32)
+
+
+    def _sigmoid(v):
+        return (1.0 / (1.0 + np.exp(-np.clip(v, -80, 80)))).astype(np.float32)
+
+
+    def critic_map(run_fn, x, S, tick, tile=CRITIC_TILE, overlap=CRITIC_OVERLAP):
+        """Per-pixel probability (H,W) that the star layer x - S holds NON-star structure (same normalisation as training: whole-image median
+        / noise sigma; tiled, centre-cropped).  run_fn feeds the critic ONNX: kn, xn (1,3,h,w), h and w multiples of 8 -> logits."""
+        C, H, W = x.shape
+        xt = np.ascontiguousarray(np.nan_to_num(x), np.float32)
+        m, s = image_stats(xt)
+        xn = ((xt - m[:, None, None]) / s[:, None, None]).astype(np.float32)
+        kn = (np.nan_to_num(x - S).astype(np.float32) / s[:, None, None]).astype(np.float32)
+        out = np.zeros((H, W), np.float32)
+        step = tile - 2 * overlap
+        for y in range(0, H, step):
+            for x_ in range(0, W, step):
+                y0, x0 = max(y - overlap, 0), max(x_ - overlap, 0)
+                y1, x1 = min(y + step + overlap, H), min(x_ + step + overlap, W)
+                a, b = kn[:, y0:y1, x0:x1], xn[:, y0:y1, x0:x1]
+                h, w = a.shape[-2:]
+                ph, pw = (-h) % 8, (-w) % 8
+                if ph or pw:
+                    md = 'reflect' if min(h, w) > max(ph, pw) else 'edge'
+                    a = np.pad(a, ((0, 0), (0, ph), (0, pw)), mode=md); b = np.pad(b, ((0, 0), (0, ph), (0, pw)), mode=md)
+                lg = np.asarray(run_fn({'kn': np.ascontiguousarray(a[None], np.float32), 'xn': np.ascontiguousarray(b[None], np.float32)})[0], np.float32)
+                p = _sigmoid(lg[0, 0])[:h, :w]
+                cy0, cx0 = y - y0, x_ - x0
+                cy1, cx1 = min(cy0 + step, h), min(cx0 + step, w)
+                out[y:y + (cy1 - cy0), x_:x_ + (cx1 - cx0)] = p[cy0:cy1, cx0:cx1]
+                tick()
+        return out
+
+
+    def _critic_tiles(H, W, tile=CRITIC_TILE, overlap=CRITIC_OVERLAP):
+        step = tile - 2 * overlap
+        return len(range(0, H, step)) * len(range(0, W, step))
+
+
+    def _h_maxima(img, h, thresh):
+        """skimage.morphology.h_maxima (8-connected, float32 image) for the pixels with img > thresh (the only ones the caller keeps).
+        Reconstruction by dilation of (img - h) under img, run per connected component of {img >= thresh - h - margin}: a path that
+        matters never leaves that set, so this equals the whole-image result on the kept pixels."""
+        from scipy import ndimage
+        img = np.asarray(img, np.float32)
+        res = (np.float32(2) * np.float32(1e-6) * np.abs(img)).astype(np.float32)
+        seed = (img.astype(np.float64) - float(h) - res.astype(np.float64)).astype(np.float32)
+        out = np.zeros(img.shape, np.uint8)
+        U = img > (thresh - h - 0.05)
+        lab, n = ndimage.label(U, structure=np.ones((3, 3), bool))
+        if n == 0:
+            return out
+        big = np.float32(-3e38)
+        ones = np.ones((3, 3), bool)
+        for i, sl in enumerate(ndimage.find_objects(lab)):
+            if sl is None:
+                continue
+            inside = lab[sl] == i + 1
+            m = np.where(inside, img[sl], big)
+            r = np.where(inside, seed[sl], big)
+            while True:
+                nr = np.minimum(ndimage.grey_dilation(r, footprint=ones, mode='constant', cval=float(big)), m)
+                if np.array_equal(nr, r):
+                    break
+                r = nr
+            out[sl] |= ((img[sl] - r >= h) & inside).astype(np.uint8)
+        return out
+
+
+    def star_protect(K, sigma=None, ring=0.0):
+        """(H,W) bool: footprint of every star in the star layer (core + halo), so Auto-keep never puts a star back (ust/infer.py star_protect)."""
+        from scipy import ndimage
+        L = _gblur(K.mean(0), 1.0)
+        sk = max(1.4826 * float(np.median(np.abs(L - np.median(L)))), 0.16 * float(sigma or 0), 1e-12)
+        LL = np.log(np.maximum(L, 0) + sk)
+        hmax = np.float64(np.log(1.5))
+        hm = _h_maxima(LL, hmax, float(np.log(5 * sk))) & (L > 4 * sk)
+        lab, n = ndimage.label(hm)
+        H, W = L.shape
+        prot = np.zeros((H, W), bool); rz = np.zeros((H, W), bool)
+        out = lambda: (prot, rz) if ring else prot
+        if n == 0:
+            return out()
+        pk = np.array(ndimage.center_of_mass(hm, lab, np.arange(1, n + 1))).round().astype(int)
+        pk[:, 0] = np.clip(pk[:, 0], 0, H - 1); pk[:, 1] = np.clip(pk[:, 1], 0, W - 1)
+        G = _gblur(K.mean(0), 1.5)
+        gy, gx = np.gradient(G); gyy, gyx = np.gradient(gy); _, gxx = np.gradient(gx)
+        py, px = pk[:, 0], pk[:, 1]
+        a, b, c = gyy[py, px], gyx[py, px], gxx[py, px]
+        tr, dt = a + c, np.sqrt(((a - c) / 2) ** 2 + b * b)
+        l1, l2 = tr / 2 - dt, tr / 2 + dt
+        peak = L[py, px]
+        keep = ((l2 < 0) & (l2 / np.minimum(l1, -1e-12) > 0.25)) | (peak > 25 * sk)
+        pk, peak = pk[keep], peak[keep]
+        if not len(pk):
+            return out()
+        th = np.maximum(6 * sk, FOOT_FRAC * peak)
+        ang = np.linspace(0, 2 * np.pi, 16, endpoint=False); rs = np.arange(1, 61, dtype=np.float32)
+        ry = pk[:, 0, None, None] + np.sin(ang)[None, :, None] * rs[None, None, :]
+        rx = pk[:, 1, None, None] + np.cos(ang)[None, :, None] * rs[None, None, :]
+        v = L[np.clip(ry.round().astype(int), 0, H - 1), np.clip(rx.round().astype(int), 0, W - 1)]
+        below = v < th[:, None, None]
+        first = np.where(below.any(-1), below.argmax(-1), len(rs) - 1)
+        rad = rs[first].max(1) + 2.0
+        rad = np.minimum(rad, np.clip(1.5 + 1.5 * np.log2(np.maximum(peak / (4 * sk), 1.0)), 2.5, 30.0))
+        for (y, x_), rr in zip(pk, rad):
+            R = int(math.ceil(rr * max(ring, 1.0))); y0, y1, x0, x1 = max(y - R, 0), min(y + R + 1, H), max(x_ - R, 0), min(x_ + R + 1, W)
+            yy, xx = np.ogrid[y0 - y:y1 - y, x0 - x_:x1 - x_]
+            d2 = yy * yy + xx * xx
+            prot[y0:y1, x0:x1] |= d2 <= rr * rr
+            if ring:
+                rz[y0:y1, x0:x1] |= d2 <= (ring * rr) ** 2
+        return out()
+
+
+    def auto_keep_mask(run_fn, x, S, stretched, sigma, tick, thr=0.5, min_area=40, max_density=0.12):
+        """Feathered (H,W) keep map from the critic (ust/infer.py auto_keep_mask, live defaults): smoothed probability > thr, components >= min_area px,
+        dilated 2 px, star cores cut out.  Where flags cover > max_density of the surrounding ~200 px the critic is out of its depth and nothing
+        is kept; pieces lying mostly in the ring just outside a star's core are halo arcs and are dropped."""
+        from scipy import ndimage
+        p = critic_map(run_fn, x, S, tick)
+        f = _gblur(p, 1.5) > thr
+        z = np.zeros(p.shape, np.float32)
+        if not f.any():
+            return z
+        dens = _gblur(f.astype(np.float32), 64.0)
+        f &= ~ndimage.binary_dilation(dens > max_density, iterations=16)
+        lab, n = ndimage.label(f)
+        if n == 0:
+            return z
+        idx = np.arange(1, n + 1)
+        area = ndimage.sum(f, lab, idx)
+        prot, rz = star_protect(star_layer(x, S, stretched), sigma, ring=RING)
+        inring = ndimage.sum(f & rz, lab, idx)
+        f = np.isin(lab, idx[(area >= min_area) & (inring <= 0.7 * area)])
+        if not f.any():
+            return z
+        f = ndimage.binary_dilation(f, iterations=2) & ~prot
+        return feather(f, 1.2)
+
+
+    def _mask_key(m):
+        return hashlib.md5(np.ascontiguousarray(m, np.float32).tobytes()).hexdigest()
+
+
+    # ------------------------------------------------------------------------------------------------ engine
+    class StarState:
+        """Cached result of Engine.remove (and what the marks / Auto-keep stages changed).  Plain attribute bag; arrays are (3,H,W) float32."""
+        pass
+
+
+    class Engine:
+        def __init__(self, model_path, session_factory, critic_factory=None):
+            self.model_path = model_path
+            self._factory = session_factory
+            self._critic_factory = critic_factory or session_factory
+            self._run, self.provider, self.note = session_factory(model_path, probe_feed())
+            self._critic = {}          # critic model path -> (run_fn, provider)
+
+        # ---- helpers
+        def _critic_run(self, path):
+            p = str(path or '')
+            if not p:
+                raise FileNotFoundError('The Auto-keep model is not installed (umbra_starless_critic_*.onnx).')
+            if p not in self._critic:
+                import os
+                if not os.path.isfile(p):
+                    raise FileNotFoundError(f'The Auto-keep model was not found: {p}')
+                rng = np.random.default_rng(2)
+                feed = {'kn': (rng.standard_normal((1, 3, 64, 64)) * 3).astype(np.float32), 'xn': (rng.standard_normal((1, 3, 64, 64)) * 3).astype(np.float32)}
+                run, prov, _ = self._critic_factory(p, feed)
+                self._critic[p] = (run, prov)
+            return self._critic[p][0]
+
+        @staticmethod
+        def _checks(cancel):
+            if cancel is not None and cancel():
+                raise RuntimeError('Cancelled')
+
+        @staticmethod
+        def _ticker(progress, cancel, total):
+            done = [0]
+
+            def tick():
+                if cancel is not None and cancel():
+                    raise RuntimeError('Cancelled')
+                done[0] += 1
+                if progress is not None:
+                    progress(min(done[0], total), total)
+            return tick
+
+        @staticmethod
+        def _finalize(st):
+            st.K = star_layer(st.x, st.S, st.stretched)
+
+        def _apply_auto(self, st, progress=None, cancel=None):
+            """st.S = st.S_raw with the critic's Auto-keep map put back (the map is computed once per Remove Stars run; a Remove mark's area is
+            never undone by it)."""
+            if not st.auto_keep:
+                st.S = st.S_raw
+                return
+            if st.ak is None:
+                run = self._critic_run(st.critic_path)
+                tick = self._ticker(progress, cancel, _critic_tiles(*st.x.shape[-2:]))
+                st.ak = auto_keep_mask(run, st.x, st.S_raw, st.stretched, st.sg, tick)
+            m = st.ak if st.carve is None else st.ak * (1 - st.carve)
+            if m.max() > 0:
+                st.S = apply_keep(st.x, st.S_raw, m)
+                st.ak_area = float((m > 0.5).mean())
+            else:
+                st.S = st.S_raw
+                st.ak_area = 0.0
+
+        # ---- stage 1: the network, once
+        def remove(self, data, params=None, progress=None, cancel=None):
+            """Remove Stars: halo pass + network + noise fill (+ Auto-keep when params['auto_keep']).  Returns the cached state."""
             p = dict(params or {})
-            amount = float(min(max(p.get('amount', 1.0), 0.0), 1.0))
             mode = p.get('mode', 'auto')
-            output = p.get('output', 'starless')
             if mode not in ('auto', 'linear', 'stretched'):
                 raise ValueError("mode must be 'auto', 'linear' or 'stretched'")
-            if output not in ('starless', 'stars'):
-                raise ValueError("output must be 'starless' or 'stars'")
             data = np.asarray(data, np.float32)
             x, lay = to_chw(data)
             bad = ~np.isfinite(x)
@@ -2061,44 +2400,153 @@ def _engine_starless():
                 x = np.ascontiguousarray(x, np.float32)
             detected = bool(is_stretched(x))
             stretched = detected if mode == 'auto' else (mode == 'stretched')
-            mode_used = 'stretched' if stretched else 'linear'
-            notes.append(f'Data: {mode_used}' + (' (auto)' if mode == 'auto' else ' (manual)'))
+            notes.append(f"Data: {'stretched' if stretched else 'linear'}" + (' (auto)' if mode == 'auto' else ' (manual)'))
             H, W = x.shape[-2:]
-            total = _n_tiles(H, W) + (_n_tiles(H // HALO_FACTOR, W // HALO_FACTOR) if min(H, W) // HALO_FACTOR >= 64 else 0)
-            done = [0]
-
-            def tick():
-                if cancel is not None and cancel():
-                    raise RuntimeError('Cancelled')
-                done[0] += 1
-                if progress is not None:
-                    progress(min(done[0], total), total)
-            if cancel is not None and cancel():
-                raise RuntimeError('Cancelled')
-            S0, sg = _starless(self._run, x, tick)
+            auto_keep = bool(p.get('auto_keep'))
+            if auto_keep:
+                self._critic_run(p.get('critic_model_path'))      # fail early, before the long run
+            total = (_n_tiles(H, W) + (_n_tiles(H // HALO_FACTOR, W // HALO_FACTOR) if min(H, W) // HALO_FACTOR >= 64 else 0)
+                     + (_critic_tiles(H, W) if auto_keep else 0))
+            tick = self._ticker(progress, cancel, total)
+            self._checks(cancel)
+            keep = {}
+            S0, sg = _starless(self._run, x, tick, keep)
             S = noise_fill(x, S0, sg)
-            K = star_layer(x, S, stretched)
-            if output == 'stars':
-                out = K
-            elif amount <= 0:
-                out = x.copy()
-            else:
-                out = reduce_stars(S, K, amount, stretched)
-            out = np.ascontiguousarray(from_chw(out, lay), np.float32)
-            stars = np.ascontiguousarray(from_chw(K, lay), np.float32)
-            if badu is not None:
-                bm = badu if lay in ('2d', '1hw', 'chw') else badu
-                if lay == '2d':
-                    out[bm] = np.nan; stars[bm] = np.nan
-                elif lay in ('1hw', 'chw'):
-                    out[:, bm] = np.nan; stars[:, bm] = np.nan
-                else:
-                    out[bm] = np.nan; stars[bm] = np.nan
+            st = StarState()
+            st.x, st.lay, st.badu, st.detected, st.mode = x, lay, badu, detected, mode
+            st.stretched = stretched
+            st.sg, st.halo, st.stats = float(sg), keep['halo'], keep['stats']
+            st.S0, st.S_base, st.S_raw, st.S = S0, S, S, S
+            st.carve, st.ak, st.ak_area = None, None, 0.0
+            st.auto_keep, st.critic_path = auto_keep, p.get('critic_model_path')
+            st.remove_key = None
+            st.notes = notes
+            st.shape = (H, W)
+            self._apply_auto(st, progress and (lambda n, t: progress(min(total, _n_tiles(H, W) + (_n_tiles(H // HALO_FACTOR, W // HALO_FACTOR) if min(H, W) // HALO_FACTOR >= 64 else 0) + n), total)), cancel)
+            self._finalize(st)
             if progress is not None:
                 progress(total, total)
+            return st
+
+        # ---- stage 2a: Remove marks (network on the touched tiles only)
+        def remove_marks(self, state, mask_remove, progress=None, cancel=None):
+            """New state with the Remove marks applied (mask_remove (H,W) in [0,1] as painted, or None / all zero = no marks).  The network re-runs
+            only on the tiles the (8 px feathered) marks touch; the blend is noise-filled locally and Auto-keep never undoes a marked area."""
+            key = None if (mask_remove is None or not np.any(mask_remove > 0)) else _mask_key(mask_remove)
+            if key == state.remove_key:
+                return state
+            st = copy.copy(state)
+            H, W = st.shape
+            S_new, carve = st.S_base, None
+            if key is not None:
+                mask = np.asarray(mask_remove, np.float32)
+                md = feather(np.maximum(mask, 0), 8.0)
+                ys, xs = np.nonzero(md > 1e-3)
+                if len(ys):
+                    reg = (int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1)
+                    step = TILE - 2 * OVERLAP
+                    n = len([1 for y in range(0, max(H - 2 * OVERLAP, 1), step) for x_ in range(0, max(W - 2 * OVERLAP, 1), step)
+                             if y < reg[1] and y + TILE > reg[0] and x_ < reg[3] and x_ + TILE > reg[2]])
+                    tick = self._ticker(progress, cancel, max(n, 1))
+                    xm = st.x if st.halo is None else st.x - st.halo
+                    S2, _ = _starless_core(self._run, xm, tick, mask=np.clip(mask, 0, 1), region=reg, stats=st.stats)
+                    S0m = np.where(md[None] > 1e-3, st.S0 * (1 - md[None]) + S2 * md[None], st.S0)
+                    pad = 64
+                    y0, y1, x0, x1 = max(reg[0] - pad, 0), min(reg[1] + pad, H), max(reg[2] - pad, 0), min(reg[3] + pad, W)
+                    if (y1 - y0) * (x1 - x0) > 0.4 * H * W:
+                        y0, y1, x0, x1 = 0, H, 0, W
+                    sl = (slice(None), slice(y0, y1), slice(x0, x1))
+                    Sc = noise_fill(st.x[sl], S0m[sl], st.sg)
+                    S_new = st.S_base.copy()
+                    S_new[sl] = np.where(md[None, y0:y1, x0:x1] > 1e-3, Sc, st.S_base[sl])
+                    carve = md
+            st.S_raw, st.carve, st.remove_key = S_new, carve, key
+            self._apply_auto(st, progress, cancel)
+            self._finalize(st)
+            return st
+
+        # ---- stage 2b: Auto-keep and data mode on the cached state
+        def set_auto_keep(self, state, on, critic_model_path=None, progress=None, cancel=None):
+            st = copy.copy(state)
+            st.auto_keep = bool(on)
+            if critic_model_path:
+                st.critic_path = critic_model_path
+            self._apply_auto(st, progress, cancel)
+            self._finalize(st)
+            return st
+
+        def set_mode(self, state, mode, progress=None, cancel=None):
+            """Data mode change: the star layer is recomputed (Auto-keep is recomputed too when the mode really changes)."""
+            st = copy.copy(state)
+            st.mode = mode
+            stretched = st.detected if mode == 'auto' else (mode == 'stretched')
+            if stretched != st.stretched:
+                st.stretched = stretched
+                st.ak = None
+                st.notes = [n for n in st.notes if not n.startswith('Data: ')]
+                st.notes.append(f"Data: {'stretched' if stretched else 'linear'}" + (' (auto)' if mode == 'auto' else ' (manual)'))
+                self._apply_auto(st, progress, cancel)
+            self._finalize(st)
+            return st
+
+        # ---- stage 3: Reduce Stars + Keep marks (cheap, from the cache)
+        def finish(self, state, amount=1.0, mask_keep=None, output='starless', raw=False):
+            """Result for the cached state.  amount 0..1 (Star removal), mask_keep (H,W) in [0,1] as painted (feathered 4 px here), output 'starless' or
+            'stars'.  Returns (out, info) like run(); raw=True keeps the engine's (3,H,W) layout and does not restore NaN (for display)."""
+            st = state
+            if output not in ('starless', 'stars'):
+                raise ValueError("output must be 'starless' or 'stars'")
+            amount = float(min(max(amount, 0.0), 1.0))
+            x, S, K, stretched = st.x, st.S, st.K, st.stretched
+            mk = None
+            if mask_keep is not None and np.any(mask_keep > 0):
+                mk = feather(mask_keep, 4.0)[None]
+            if output == 'stars':
+                out = K if mk is None else star_layer(x, S * (1 - mk) + x * mk, stretched)
+                stars = out
+            else:
+                out = x.copy() if amount <= 0 else reduce_stars(S, K, amount, stretched)
+                if mk is not None:
+                    out = out * (1 - mk) + x * mk
+                stars = K if mk is None else star_layer(x, S * (1 - mk) + x * mk, stretched)
+            notes = list(st.notes)
+            if st.auto_keep:
+                notes.append('Auto-keep: nothing to put back.' if st.ak_area <= 0 else f'Auto-keep put back {100 * st.ak_area:.2f}% of the image.')
             if self.note:
                 notes.append(str(self.note))
-            return out, {'notes': notes, 'stars': stars, 'mode_used': mode_used, 'sigma': float(sg)}
+            info = {'notes': notes, 'mode_used': 'stretched' if stretched else 'linear', 'sigma': float(st.sg), 'state': st}
+            if raw:
+                info['stars'] = stars
+                return np.ascontiguousarray(out, np.float32), info
+            lay, badu = st.lay, st.badu
+            out = np.ascontiguousarray(from_chw(out, lay), np.float32)
+            stars = np.ascontiguousarray(from_chw(stars, lay), np.float32)
+            if badu is not None:
+                if lay == '2d':
+                    out[badu] = np.nan; stars[badu] = np.nan
+                elif lay in ('1hw', 'chw'):
+                    out[:, badu] = np.nan; stars[:, badu] = np.nan
+                else:
+                    out[badu] = np.nan; stars[badu] = np.nan
+            info['stars'] = stars
+            return out, info
+
+        # ---- everything at once (Apply / CLI)
+        def run(self, data, params=None, progress=None, cancel=None):
+            p = dict(params or {})
+            amount = float(min(max(p.get('amount', 1.0), 0.0), 1.0))
+            output = p.get('output', 'starless')
+            if output not in ('starless', 'stars'):
+                raise ValueError("output must be 'starless' or 'stars'")
+            mr = p.get('mask_remove')
+            has_marks = mr is not None and bool(np.any(mr > 0))
+            st = self.remove(data, p, progress, cancel)
+            if has_marks:
+                st = self.remove_marks(st, mr, None, cancel)
+            out, info = self.finish(st, amount, p.get('mask_keep'), output)
+            if not p.get('return_state'):
+                info.pop('state', None)
+            return out, info
     return types.SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
 
 
@@ -2106,29 +2554,1141 @@ ENGINES['starless'] = _engine_starless()
 
 # ============================================================================================ tools
 def _tool_starless():
-    # ---- Umbra Starless: tool layer ----
+    # ---- Umbra Starless: tool layer (panel, correction-marks editor, ToolSpec) ----
+    import copy
     REMOVAL_TIP = ('100% = all stars gone, 0% = stars untouched (the original image). In between every star gets smaller and dimmer '
                    'until it vanishes.')
+    AUTO_KEEP_TIP = ('A small checker network looks at the star layer and puts nebula filaments, dust-lane edges or galaxy '
+                     'detail that were removed by mistake back into the starless image (like a Keep mark). Star cores are '
+                     'never put back. Paint Keep marks for anything it misses.')
     DATA_TIP = 'Linear or stretched. Auto detects it from the image; override if the guess is wrong.'
     OUTPUT_TIP = 'Stars only is the full star layer (ignores Star removal).'
     SAVE_TIP = 'Saves the star layer as <image>_stars.fit in the same folder (a new file; the image is not touched).'
+    CRITIC_MISSING = 'Auto-keep needs the Auto-keep model. Press Download model.'
+    CRITIC_KIND = 'critic'
+
+    MAX_ZOOM = 16
+    MAX_STROKES = 600
+    MAX_POINTS = 4096
+    SOFTNESS = 0.35
+    REMOVE_RGB, KEEP_RGB = (255, 60, 60), (60, 220, 90)
 
 
+    # ----------------------------------------------------------------------------------------------- brush masks (v0.0.4)
+    def smoothstep(a, b, x):
+        if b <= a + 1e-8:
+            return (x >= b).astype(np.float32)
+        t = np.clip((x - a) / (b - a), 0, 1)
+        return t * t * (3 - 2 * t)
+
+
+    def brush_mask(shape, strokes, window=None):
+        """Replay portable normalized strokes (points in 0..1 of the image, row-down; size = brush diameter / min(h, w)).
+        One stroke has uniform maximum opacity: distance to line segments avoids holes between sparse pointer events and the
+        maximum dab coverage within a stroke avoids speed-dependent buildup. Separate strokes alpha-composite, including erasure.
+        window=(x0,y0,x1,y1) renders only that part of the full-size mask."""
+        h, w = shape
+        X0, Y0, X1, Y1 = window if window is not None else (0, 0, w, h)
+        canvas = np.zeros((Y1 - Y0, X1 - X0), np.float32)
+        sx = max(w - 1, 1)
+        sy = max(h - 1, 1)
+        for stroke in strokes:
+            points = np.asarray(stroke['points'], np.float32) * np.array([sx, sy], np.float32)
+            if not len(points):
+                continue
+            radius = max(.5 * stroke['size'] * min(h, w), .5)
+            x0 = max(X0, int(np.floor(points[:, 0].min() - radius)))
+            x1 = min(X1, int(np.ceil(points[:, 0].max() + radius)) + 1)
+            y0 = max(Y0, int(np.floor(points[:, 1].min() - radius)))
+            y1 = min(Y1, int(np.ceil(points[:, 1].max() + radius)) + 1)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            coverage = np.zeros((y1 - y0, x1 - x0), np.float32)
+            segments = zip(points[:-1], points[1:]) if len(points) > 1 else [(points[0], points[0])]
+            for a, b in segments:
+                xa = max(x0, int(np.floor(min(a[0], b[0]) - radius)))
+                xb = min(x1, int(np.ceil(max(a[0], b[0]) + radius)) + 1)
+                ya = max(y0, int(np.floor(min(a[1], b[1]) - radius)))
+                yb = min(y1, int(np.ceil(max(a[1], b[1]) + radius)) + 1)
+                if xb <= xa or yb <= ya:
+                    continue
+                yy, xx = np.ogrid[ya:yb, xa:xb]
+                dx, dy = b - a
+                den = float(dx * dx + dy * dy)
+                t = np.clip(((xx - a[0]) * dx + (yy - a[1]) * dy) / max(den, 1e-12), 0, 1)
+                distance = np.sqrt((xx - a[0] - t * dx) ** 2 + (yy - a[1] - t * dy) ** 2)
+                if stroke['softness'] <= 1e-6:
+                    weight = (distance <= radius).astype(np.float32)
+                else:
+                    weight = 1 - smoothstep(radius * (1 - stroke['softness']), radius, distance)
+                patch = coverage[ya - y0:yb - y0, xa - x0:xb - x0]
+                np.maximum(patch, weight, out=patch)
+            alpha = coverage * stroke['opacity']
+            patch = canvas[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+            if stroke['erase']:
+                patch *= 1 - alpha
+            else:
+                patch += alpha * (1 - patch)
+        return np.clip(canvas, 0, 1)
+
+
+    def stroke_layers(strokes, layer):
+        """Strokes that make up one mask: its own strokes plus every eraser stroke (the eraser works on both layers, in order)."""
+        return [s for s in strokes if s['layer'] == layer or s['erase']]
+
+
+    def has_paint(strokes, layer):
+        return any(not s['erase'] for s in stroke_layers(strokes, layer))
+
+
+    def strokes_signature(strokes):
+        return hashlib.sha1(json.dumps(strokes, sort_keys=True).encode()).hexdigest()
+
+
+    def brush_fraction(v):
+        """Brush slider 1..100 -> stroke 'size' (diameter as a fraction of min(h, w))."""
+        return 0.0008 + (v / 100.0) ** 2 * 0.12
+
+
+    def masks_from_strokes(strokes, shape, flip=False):
+        """(mask_remove, mask_keep) float32 (H,W) in ARRAY row order from strokes drawn in display coordinates (row 0 = top of the picture).
+        flip=True: the picture is the array flipped vertically (Siril shows its bottom-up rows flipped), so the masks are flipped back."""
+        out = []
+        for layer in ('remove', 'keep'):
+            if has_paint(strokes, layer):
+                m = brush_mask(shape, stroke_layers(strokes, layer))
+                out.append(np.ascontiguousarray(m[::-1] if flip else m, np.float32))
+            else:
+                out.append(None)
+        return out[0], out[1]
+
+
+    # ----------------------------------------------------------------------------------------------- display helpers
+    def downsample_mean(a, b):
+        """(..., H, W) -> (..., ceil(H/b), ceil(W/b)) by area mean (edge-padded)."""
+        if b <= 1:
+            return a
+        H, W = a.shape[-2:]
+        ph, pw = (-H) % b, (-W) % b
+        if ph or pw:
+            a = np.pad(a, [(0, 0)] * (a.ndim - 2) + [(0, ph), (0, pw)], mode='edge')
+        Hb, Wb = a.shape[-2] // b, a.shape[-1] // b
+        return a.reshape(*a.shape[:-2], Hb, b, Wb, b).mean((-3, -1), dtype=np.float32)
+
+
+    def stf_params(x):
+        """Display auto-stretch for linear data (linked channels): black point and midtone so the sky median shows at 0.25."""
+        sub = x[..., ::4, ::4]
+        med = float(np.median(sub))
+        mad = float(np.median(np.abs(sub - med))) * 1.4826
+        black = float(np.clip(med - 2.8 * mad, 0, 0.9))
+        x0 = max((med - black) / max(1 - black, 1e-6), 1e-6)
+        T = 0.25
+        m = x0 * (T - 1) / (2 * T * x0 - T - x0)
+        return black, float(np.clip(m, 1e-4, 0.9999))
+
+
+    def apply_stf(a, black, m):
+        y = np.clip((a - black) / max(1 - black, 1e-6), 0, 1)
+        return (m - 1) * y / ((2 * m - 1) * y - m)
+
+
+    def to_rgb8_chw(arr, kind, stretched, stf, kdisp):
+        if kind == 'stars':
+            v = np.clip(arr / kdisp, 0, 1) ** 0.4
+        elif stf and not stretched:
+            v = apply_stf(arr, *stf)
+        else:
+            v = np.clip(arr, 0, 1)
+        return np.ascontiguousarray((np.clip(v, 0, 1).transpose(1, 2, 0) * 255 + 0.5).astype(np.uint8))
+
+
+    def render_crop(src, shape, rect, scale, flip, kind, stretched, stf, kdisp):
+        """Crop of a full-resolution (3,H,W) array for the view: rect = (x0,y0,x1,y1) in display coordinates, scale = device pixels per image pixel.
+        Block-mean downsampled when zoomed out.  Returns (rgb8 in display orientation, (X, Y, W, H) in display pixels) or None."""
+        H, W = shape
+        x0, y0 = max(int(rect[0]), 0), max(int(rect[1]), 0)
+        x1, y1 = min(int(math.ceil(rect[2])), W), min(int(math.ceil(rect[3])), H)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        b = max(int(1.0 / max(scale, 1e-6)), 1)
+        while (x1 - x0) * (y1 - y0) / (b * b) > 4e6:
+            b += 1
+        gx0, gy0 = x0 // b * b, y0 // b * b
+        gx1, gy1 = min(-(-x1 // b) * b, W), min(-(-y1 // b) * b, H)
+        if flip:
+            piece = src[:, H - gy1:H - gy0, gx0:gx1][:, ::-1]
+        else:
+            piece = src[:, gy0:gy1, gx0:gx1]
+        arr = downsample_mean(piece, b)
+        return to_rgb8_chw(arr, kind, stretched, stf, kdisp), (gx0, gy0, arr.shape[2] * b, arr.shape[1] * b)
+
+
+    # ----------------------------------------------------------------------------------------------- the editor (Preview window)
+    _EDITOR = {}
+
+
+    def editor_class():
+        """The live-style Preview window, built once (PyQt6 is imported only when it is first opened)."""
+        if _EDITOR:
+            return _EDITOR['cls']
+        from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRectF, QPointF
+        from PyQt6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QPainterPath, QCursor, QShortcut, QKeySequence
+        from PyQt6.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton, QSlider, QProgressBar, QCheckBox,
+                                     QGraphicsView, QGraphicsScene, QGraphicsItem, QApplication)
+        q = _qt()
+        ModernComboBox = q.ModernComboBox
+
+        class ImageCanvasItem(QGraphicsItem):
+            """Image in source-pixel scene coordinates: a low-res base, a sharp detail crop of what is visible, and mark overlays."""
+            def __init__(self):
+                super().__init__()
+                self.bounds = QRectF(0, 0, 1, 1)
+                self.base = QPixmap()
+                self.detail = QPixmap()
+                self.detail_rect = QRectF()
+                self.detail_native = False
+                self.overlays = []
+                self.overlay_visible = True
+
+            def boundingRect(self):
+                return self.bounds
+
+            def set_source_shape(self, shape):
+                h, w = shape
+                b = QRectF(0, 0, w, h)
+                if b != self.bounds:
+                    self.prepareGeometryChange()
+                    self.bounds = b
+                    self.update()
+
+            def set_base(self, pm):
+                self.base = pm
+                self.update()
+
+            def set_detail(self, pm, rect, native):
+                self.detail, self.detail_rect, self.detail_native = pm, rect, native
+                self.update()
+
+            def set_overlays(self, items):
+                self.overlays = items
+                self.update()
+
+            def paint(self, painter, option, widget=None):
+                if not self.base.isNull():
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                    painter.drawPixmap(self.bounds, self.base, QRectF(self.base.rect()))
+                if not self.detail.isNull():
+                    physical = math.hypot(painter.deviceTransform().m11(), painter.deviceTransform().m12())
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, not self.detail_native or physical < .999999)
+                    painter.drawPixmap(self.detail_rect, self.detail, QRectF(self.detail.rect()))
+                if self.overlay_visible:
+                    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+                    painter.setOpacity(0.45)
+                    for img in self.overlays:
+                        painter.drawImage(self.bounds, img)
+
+        class ImageView(QGraphicsView):
+            """Fit / wheel zoom / drag pan and the correction brushes. Strokes are stored in image-normalised coordinates (0..1, row-down)."""
+            viewChanged = pyqtSignal()
+            strokeEnded = pyqtSignal()
+
+            def __init__(self):
+                super().__init__()
+                self.scene_ = QGraphicsScene(self)
+                self.setScene(self.scene_)
+                self.item = ImageCanvasItem()
+                self.scene_.addItem(self.item)
+                self.fit_mode = True
+                self._fitting = False
+                self.tool = 'navigate'          # navigate | remove | keep | erase
+                self.brush_size = brush_fraction(30)
+                self.strokes = []               # shared with the window
+                self.draft = None
+                self.cursor_pos = None
+                self.mpan = None
+                self.source_shape = (1, 1)
+                self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+                self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+                self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+                self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                self.setBackgroundBrush(QColor('#151515'))
+                self.setMinimumWidth(360)
+                self.setMouseTracking(True)
+                self.viewport().setMouseTracking(True)
+                self.setFrameShape(QGraphicsView.Shape.NoFrame)
+                self.setToolTip('Scroll to zoom, drag to pan (Navigate tool; middle button pans with any tool). Hold Space to show the original.')
+
+            def set_tool(self, tool):
+                self.tool = tool
+                self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag if tool == 'navigate' else QGraphicsView.DragMode.NoDrag)
+                self.viewport().setCursor(QCursor(Qt.CursorShape.OpenHandCursor if tool == 'navigate' else Qt.CursorShape.CrossCursor))
+                self.viewport().update()
+
+            def set_image_shape(self, shape):
+                self.source_shape = tuple(shape)
+                self.item.set_source_shape(shape)
+                if self.scene_.sceneRect() != self.item.boundingRect():
+                    self.scene_.setSceneRect(self.item.boundingRect())
+
+            # pixel i covers scene [i, i+1]; strokes use pixel centres like brush_mask
+            def normalized_point(self, pos):
+                h, w = self.source_shape
+                return [float(np.clip((pos.x() - 0.5) / max(w - 1, 1), 0, 1)), float(np.clip((pos.y() - 0.5) / max(h - 1, 1), 0, 1))]
+
+            def scene_point(self, p):
+                h, w = self.source_shape
+                return QPointF(p[0] * max(w - 1, 1) + 0.5, p[1] * max(h - 1, 1) + 0.5)
+
+            def visible_rect(self):
+                r = self.mapToScene(self.viewport().rect()).boundingRect().intersected(self.item.boundingRect())
+                return (r.left(), r.top(), r.right(), r.bottom())
+
+            def device_scale(self):
+                return max(abs(self.transform().m11()) * self.devicePixelRatioF(), 1e-9)
+
+            def fit(self):
+                if self._fitting:
+                    return
+                self._fitting = True
+                try:
+                    self.fit_mode = True
+                    self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                    self.resetTransform()
+                    self.fitInView(self.item.boundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+                finally:
+                    self._fitting = False
+                self.viewChanged.emit()
+
+            def resizeEvent(self, event):
+                super().resizeEvent(event)
+                if self._fitting:
+                    return
+                if self.fit_mode:
+                    self.fit()
+                else:
+                    self.viewChanged.emit()
+
+            def scrollContentsBy(self, dx, dy):
+                super().scrollContentsBy(dx, dy)
+                if not self._fitting:
+                    self.viewChanged.emit()
+
+            def wheelEvent(self, event):
+                if self.draft is not None:
+                    event.accept()
+                    return
+                current = max(abs(self.transform().m11()), 1.e-9)
+                r = self.item.boundingRect()
+                fitted = min(max(1, self.viewport().width() - 4) / max(r.width(), 1), max(1, self.viewport().height() - 4) / max(r.height(), 1))
+                floor = min(fitted / 3, 1 / max(self.devicePixelRatioF(), 1.e-6))
+                delta = event.angleDelta().y() or event.pixelDelta().y()
+                if not delta:
+                    event.accept()
+                    return
+                ceiling = MAX_ZOOM / max(self.devicePixelRatioF(), 1.e-6)
+                factor = 1.2 if delta > 0 else 1 / 1.2
+                factor = min(max(factor, floor / current), max(ceiling / current, 1.))
+                self.fit_mode = False
+                self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                self.scale(factor, factor)
+                self.viewChanged.emit()
+                event.accept()
+
+            def mousePressEvent(self, event):
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    self.mpan = event.position()
+                    event.accept()
+                    return
+                if self.tool != 'navigate' and event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+                    pos = self.mapToScene(event.position().toPoint())
+                    if self.item.boundingRect().contains(pos) and len(self.strokes) < MAX_STROKES:
+                        erase = self.tool == 'erase' or event.button() == Qt.MouseButton.RightButton
+                        self.draft = dict(layer='both' if erase else self.tool, erase=bool(erase), size=float(self.brush_size), softness=SOFTNESS,
+                                          opacity=1.0, points=[self.normalized_point(pos)])
+                        self.strokes.append(self.draft)
+                        self.cursor_pos = pos
+                        self.viewport().update()
+                    event.accept()
+                    return
+                super().mousePressEvent(event)
+
+            def mouseMoveEvent(self, event):
+                if self.mpan is not None:
+                    d = event.position() - self.mpan
+                    self.mpan = event.position()
+                    self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(d.x()))
+                    self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(d.y()))
+                    event.accept()
+                    return
+                pos = self.mapToScene(event.position().toPoint())
+                self.cursor_pos = pos if self.item.boundingRect().contains(pos) else None
+                if self.draft is not None:
+                    if self.item.boundingRect().contains(pos) and len(self.draft['points']) < MAX_POINTS:
+                        last = self.scene_point(self.draft['points'][-1])
+                        if abs(pos.x() - last.x()) + abs(pos.y() - last.y()) >= 1.0:
+                            self.draft['points'].append([round(v, 7) for v in self.normalized_point(pos)])
+                    self.viewport().update()
+                    event.accept()
+                    return
+                if self.tool != 'navigate':
+                    self.viewport().update()
+                    event.accept()
+                    return
+                super().mouseMoveEvent(event)
+
+            def mouseReleaseEvent(self, event):
+                if event.button() == Qt.MouseButton.MiddleButton:
+                    self.mpan = None
+                    event.accept()
+                    return
+                if self.draft is not None:
+                    self.draft = None
+                    self.viewport().update()
+                    self.strokeEnded.emit()
+                    event.accept()
+                    return
+                super().mouseReleaseEvent(event)
+
+            def leaveEvent(self, event):
+                self.cursor_pos = None
+                self.viewport().update()
+                super().leaveEvent(event)
+
+            def drawForeground(self, painter, rect):
+                super().drawForeground(painter, rect)
+                if self.draft is not None:   # live trail while the mouse is down (the overlay bitmap is rebuilt on release)
+                    pts = [self.scene_point(p) for p in self.draft['points']]
+                    col = QColor(*(REMOVE_RGB if self.draft['layer'] == 'remove' else KEEP_RGB if self.draft['layer'] == 'keep' else (200, 200, 200)), 110)
+                    pen = QPen(col)
+                    pen.setWidthF(max(self.draft['size'] * min(self.source_shape), 1.0))
+                    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                    painter.save()
+                    painter.setPen(pen)
+                    if len(pts) == 1:
+                        painter.drawPoint(pts[0])
+                    else:
+                        path = QPainterPath(pts[0])
+                        for p in pts[1:]:
+                            path.lineTo(p)
+                        painter.drawPath(path)
+                    painter.restore()
+                if self.tool != 'navigate' and self.cursor_pos is not None:
+                    rad = max(self.brush_size * min(self.source_shape) / 2, 0.5)
+                    painter.save()
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    pen = QPen(QColor('#111111'), 3)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawEllipse(self.cursor_pos, rad, rad)
+                    pen = QPen(QColor(*(REMOVE_RGB if self.tool == 'remove' else KEEP_RGB if self.tool == 'keep' else (235, 235, 235))), 1)
+                    pen.setCosmetic(True)
+                    painter.setPen(pen)
+                    painter.drawEllipse(self.cursor_pos, rad, rad)
+                    painter.restore()
+
+        class Job(QThread):
+            """Runs fn(progress, cancel) off the GUI thread; progress(n, total)."""
+            done = pyqtSignal(object)
+            failed = pyqtSignal(str)
+            prog = pyqtSignal(int, int)
+
+            def __init__(self, fn):
+                super().__init__()
+                self.fn = fn
+                self._cancel = False
+                self.secs = 0.0
+
+            def cancel(self):
+                self._cancel = True
+
+            def run(self):
+                t0 = time.time()
+                try:
+                    res = self.fn(lambda n, t: self.prog.emit(int(n), int(t)), lambda: self._cancel)
+                    self.secs = time.time() - t0
+                    self.done.emit(res)
+                except BaseException as e:
+                    if str(e) == 'Cancelled':
+                        self.failed.emit('Cancelled.')
+                    else:
+                        import traceback
+                        tb = traceback.format_exc()
+                        try:
+                            write_error_log(_EDITOR['spec'], tb)
+                        except Exception:
+                            pass
+                        self.failed.emit(f'{type(e).__name__}: {e}')
+
+        class RenderThread(QThread):
+            done = pyqtSignal(object, float)
+            failed = pyqtSignal(str)
+
+            def __init__(self, fn):
+                super().__init__()
+                self.fn = fn
+
+            def run(self):
+                t0 = time.time()
+                try:
+                    self.done.emit(self.fn(), time.time() - t0)
+                except BaseException as e:
+                    self.failed.emit(f'{type(e).__name__}: {e}')
+
+        class Editor(QWidget):
+            """Umbra Starless Preview (BETA): the whole image at full resolution, computed once (Remove Stars); zoom / pan; correction marks;
+            Star removal and Keep marks update instantly from the cache; Remove marks re-run the network on the touched tiles only."""
+            def __init__(self, host, spec):
+                super().__init__()
+                self.host, self.spec = host, spec
+                _EDITOR['spec'] = spec
+                self.setWindowTitle(f'{spec.name} Preview (BETA)')
+                self.setStyleSheet(STYLE + 'QPushButton#ToolRemove:checked { background: #9c2f2f; border-color: #e05050; } '
+                                   'QPushButton#ToolKeep:checked { background: #2c7a3e; border-color: #4fc46b; } QLabel#Head { font-weight: bold; }')
+                self.resize(1180, 780)
+                self.strokes = []
+                self.state = None            # StarState of the cached Remove Stars run
+                self.shape = (1, 1)
+                self.data = self.meta = self.identity = self.model_path = None
+                self.flip = False
+                self.job = None
+                self.render_thread = None
+                self.render_dirty = False
+                self.finish_dirty = False
+                self.res = None              # dict(out, stars, kdisp, version) of the last finish
+                self.stf = None
+                self.holding = False
+                self.timings = {}
+                self.last_render_ms = None
+                self.version = 0
+                self.pending_marks_after = False
+                root = QHBoxLayout(self)
+                root.setContentsMargins(10, 10, 10, 8)
+                root.setSpacing(10)
+                side = QWidget()
+                side.setFixedWidth(300)
+                sl = QVBoxLayout(side)
+                sl.setContentsMargins(0, 0, 0, 0)
+                sl.setSpacing(8)
+                sl.addWidget(QLabel(f'{spec.name} (BETA)', objectName='Title'))
+                sl.addWidget(QLabel('Remove Stars once, then everything below is instant. Star removal, Data and Auto-keep are in the main window.',
+                                    objectName='Note', wordWrap=True))
+                card = self.card(sl)
+                card.addWidget(QLabel('View', objectName='Head'))
+                self.orig_btn = QPushButton('Show original (hold, or Space)')
+                self.orig_btn.setToolTip('Hold the button (or the Space key) to see the original; release to go back to the result.')
+                card.addWidget(self.orig_btn)
+                self.stars_btn = QPushButton('Show star layer')
+                self.stars_btn.setCheckable(True)
+                card.addWidget(self.stars_btn)
+                self.stf_box = QCheckBox('Auto-stretch the preview (linear data)')
+                self.stf_box.setChecked(True)
+                self.stf_box.setToolTip('Display only. The output is never stretched.')
+                card.addWidget(self.stf_box)
+                card = self.card(sl)
+                card.addWidget(QLabel('Correction marks', objectName='Head'))
+                trow = QHBoxLayout()
+                self.tool_btns = {}
+                for key, text, oid, tip in (('navigate', 'Navigate', None, 'Drag to pan.'),
+                                            ('remove', 'Remove', 'ToolRemove', 'Red: paint where stars or residue were wrongly kept, then press Apply marks.'),
+                                            ('keep', 'Keep', 'ToolKeep', 'Green: paint where something was wrongly removed (a galaxy or nebula knot). Instant.'),
+                                            ('erase', 'Eraser', None, 'Erase marks (right mouse button erases with any brush).')):
+                    b = QPushButton(text)
+                    if oid:
+                        b.setObjectName(oid)
+                    b.setCheckable(True)
+                    b.setToolTip(tip)
+                    b.clicked.connect(lambda _=False, k=key: self.set_tool(k))
+                    trow.addWidget(b)
+                    self.tool_btns[key] = b
+                card.addLayout(trow)
+                self.brush, self.bval = self.make_slider(card, 'Brush size', 1, 100, 30, lambda v: f'{v}', 'Brush diameter.')
+                urow = QHBoxLayout()
+                self.undo_btn = QPushButton('Undo stroke')
+                self.clear_btn = QPushButton('Clear marks')
+                urow.addWidget(self.undo_btn)
+                urow.addWidget(self.clear_btn)
+                card.addLayout(urow)
+                self.show_marks = QCheckBox('Show marks')
+                self.show_marks.setChecked(True)
+                card.addWidget(self.show_marks)
+                self.auto_marks = QCheckBox('Apply Remove marks after each stroke')
+                card.addWidget(self.auto_marks)
+                self.marks_btn = QPushButton('Apply marks')
+                self.marks_btn.setToolTip('Re-runs the network where Remove marks are painted (Keep marks are always live).')
+                card.addWidget(self.marks_btn)
+                self.marks_note = QLabel('', objectName='Note', wordWrap=True)
+                card.addWidget(self.marks_note)
+                card = self.card(sl)
+                prow = QHBoxLayout()
+                self.progress = QProgressBar()
+                self.progress.setRange(0, 1000)
+                self.progress.setTextVisible(False)
+                self.progress.hide()
+                prow.addWidget(self.progress, 1)
+                self.cancel_btn = QPushButton('Cancel')
+                self.cancel_btn.hide()
+                prow.addWidget(self.cancel_btn)
+                card.addLayout(prow)
+                self.msg = QLabel('', objectName='Note', wordWrap=True)
+                card.addWidget(self.msg)
+                sl.addStretch(1)
+                close = QPushButton('Close')
+                close.clicked.connect(self.close)
+                sl.addWidget(close)
+                root.addWidget(side)
+                right = QVBoxLayout()
+                right.setSpacing(4)
+                self.view = ImageView()
+                self.view.strokes = self.strokes
+                right.addWidget(self.view, 1)
+                self.status = QLabel('', objectName='Caption', wordWrap=True)
+                right.addWidget(self.status)
+                root.addLayout(right, 1)
+                self.rtimer = QTimer(self)
+                self.rtimer.setSingleShot(True)
+                self.rtimer.timeout.connect(self.refresh)
+                self.ftimer = QTimer(self)
+                self.ftimer.setSingleShot(True)
+                self.ftimer.timeout.connect(self.start_finish)
+                self.marks_btn.clicked.connect(self.start_marks)
+                self.undo_btn.clicked.connect(self.undo_stroke)
+                self.clear_btn.clicked.connect(self.clear_marks)
+                self.cancel_btn.clicked.connect(self.cancel)
+                self.brush.valueChanged.connect(self.brush_changed)
+                self.show_marks.toggled.connect(self.update_overlays)
+                self.stf_box.toggled.connect(lambda v: (self.update_base(), self.request_refresh(10)))
+                self.stars_btn.toggled.connect(lambda c: self.request_refresh(0))
+                self.view.viewChanged.connect(lambda: self.request_refresh(50))
+                self.view.strokeEnded.connect(self.stroke_ended)
+                self.orig_btn.pressed.connect(lambda: self.hold_original(True))
+                self.orig_btn.released.connect(lambda: self.hold_original(False))
+                QShortcut(QKeySequence('Ctrl+Z'), self, activated=self.undo_stroke)
+                self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                self.set_tool('navigate')
+                self.update_controls()
+
+            # ---- small helpers
+            def card(self, parent_layout):
+                w = QWidget(objectName='Card')
+                cl = QVBoxLayout(w)
+                cl.setContentsMargins(12, 9, 12, 10)
+                cl.setSpacing(6)
+                parent_layout.addWidget(w)
+                return cl
+
+            def make_slider(self, layout, text, lo, hi, default, fmt, tip=None):
+                row = QHBoxLayout()
+                label = QLabel(text)
+                row.addWidget(label)
+                val = QLabel(fmt(default), objectName='Value')
+                val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                row.addWidget(val)
+                layout.addLayout(row)
+                s = QSlider(Qt.Orientation.Horizontal)
+                s.setRange(lo, hi)
+                s.setValue(default)
+                s.valueChanged.connect(lambda v, l=val: l.setText(fmt(v)))
+                if tip:
+                    label.setToolTip(tip)
+                    s.setToolTip(tip)
+                layout.addWidget(s)
+                return s, val
+
+            def set_msg(self, text, error=False):
+                self.msg.setText(text)
+                self.msg.setStyleSheet('color: #e05050;' if error else '')
+                self.host.set_status(text, error) if text else None
+
+            job_active = False
+
+            def busy(self):
+                return self.job_active
+
+            def ready(self):
+                return self.state is not None
+
+            def pending_remove(self):
+                s = self.state
+                if s is None:
+                    return False
+                rs = [t for t in stroke_layers(self.strokes, 'remove')]
+                key = strokes_signature(rs) if has_paint(self.strokes, 'remove') else None
+                return key != self.applied_sig
+
+            applied_sig = None
+
+            def update_controls(self):
+                b = self.busy()
+                ready = self.ready()
+                for k in ('remove', 'keep', 'erase'):
+                    self.tool_btns[k].setEnabled(True)
+                self.undo_btn.setEnabled(bool(self.strokes) and not b)
+                self.clear_btn.setEnabled(bool(self.strokes) and not b)
+                self.marks_btn.setEnabled(not b and ready and self.pending_remove())
+                self.stars_btn.setEnabled(ready)
+                nr = len([s for s in stroke_layers(self.strokes, 'remove') if not s['erase']])
+                nk = len([s for s in stroke_layers(self.strokes, 'keep') if not s['erase']])
+                note = f'{nr} Remove, {nk} Keep stroke(s).'
+                if nr:
+                    note += ' Remove marks are applied.' if (not self.pending_remove() and ready) else (' Press Apply marks to re-run the network.' if ready else ' Remove Stars first.')
+                self.marks_note.setText(note)
+
+            def update_status(self):
+                s = self.state
+                if s is None:
+                    self.status.setText('')
+                    return
+                eng = _ENGINE_CACHE.get(self.spec.key)
+                parts = [f'Model: {model_label(self.spec, Path(self.model_path).stem)}', f'Device: {eng[1].provider if eng else "?"}',
+                         f'Data: {"stretched" if s.stretched else "linear"}']
+                for k, label in (('remove', 'Remove Stars'), ('marks', 'Marks'), ('auto', 'Auto-keep'), ('mode', 'Data'), ('finish', 'Update')):
+                    if k in self.timings:
+                        parts.append(f'{label} {self.timings[k]:.1f} s')
+                if self.last_render_ms is not None:
+                    parts.append(f'preview {self.last_render_ms:.0f} ms')
+                self.status.setText('   |   '.join(parts))
+
+            # ---- opening / jobs
+            def open_image(self, data, meta, identity, params, model_path):
+                """Preview pressed: show the image, then Remove Stars on the whole image (once)."""
+                if self.busy():
+                    return
+                from_scratch = not (self.state is not None and self.identity == identity and self.model_path == model_path)
+                self.data, self.meta, self.identity, self.model_path = data, meta, identity, model_path
+                self.flip = self.host.siril is not None
+                self.show(); self.raise_()
+                if not from_scratch:
+                    self.set_msg('Showing the cached result (same image and model). Press Preview again after changing the image.')
+                    self.request_finish(0)
+                    return
+                x, lay = ENGINES['starless'].to_chw(data)
+                det = bool(ENGINES['starless'].is_stretched(np.ascontiguousarray(x)))
+                self.shape = tuple(x.shape[-2:])
+                self.state = None
+                self.res = None
+                self.applied_sig = None
+                self.version += 1
+                self.stf = stf_params(x)
+                self.view.set_image_shape(self.shape)
+                self.view.item.set_base(self.pixmap(to_rgb8_chw(downsample_mean(x[:, ::-1] if self.flip else x, max(1, int(math.ceil(max(self.shape) / 1024)))),
+                                                                  'image', det, self.stf if self.stf_box.isChecked() else None, 1.0)))
+                self.view.item.set_detail(QPixmap(), QRectF(), False)
+                self.view.fit()
+                self.brush_changed(self.brush.value())
+                self.update_overlays()
+                mode, ak, cp = params['mode'], params.get('auto_keep'), params.get('critic_model_path')
+                self.start_remove(dict(mode=mode, auto_keep=bool(ak and cp), critic_model_path=cp))
+
+            def run_job(self, fn, text, on_done, key):
+                self.job_active = True
+                self.job = Job(fn)
+                self.job.prog.connect(self.on_progress)
+                self.job.done.connect(lambda res, k=key, f=on_done: self.job_done(res, k, f))
+                self.job.failed.connect(self.job_failed)
+                self.progress.setRange(0, 0)
+                self.progress.show()
+                self.cancel_btn.show()
+                self.cancel_btn.setEnabled(True)
+                self.set_msg(text)
+                self.host.set_busy(True)
+                self.update_controls()
+                self.job.start()
+
+            def end_job(self):
+                self.job.wait()
+                self.job_active = False
+                try:
+                    self.progress.hide()
+                    self.cancel_btn.hide()
+                    self.host.set_busy(False)
+                except RuntimeError:                 # window already deleted
+                    pass
+
+            def on_progress(self, n, total):
+                if total > 0:
+                    self.progress.setRange(0, total)
+                    self.progress.setValue(n)
+                    self.host.on_progress(n, total)
+
+            def job_done(self, res, key, on_done):
+                self.timings[key] = self.job.secs
+                self.end_job()
+                on_done(res)
+                self.update_controls()
+                self.update_status()
+                if self.finish_dirty and not self.busy():
+                    self.finish_dirty = False
+                    self.start_finish()
+
+            def job_failed(self, msg):
+                self.end_job()
+                self.update_controls()
+                if msg == 'Cancelled.':
+                    self.set_msg('Cancelled.')
+                else:
+                    self.set_msg(msg, True)
+                self.request_refresh(10)
+
+            def cancel(self):
+                if self.busy():
+                    self.job.cancel()
+                    self.cancel_btn.setEnabled(False)
+
+            def engine(self):
+                return get_engine(self.spec, self.model_path)
+
+            def start_remove(self, p):
+                data, path = self.data, self.model_path
+                loading = str(path) not in [c[0] for c in _ENGINE_CACHE.values()]
+
+                def fn(prog, cancel):
+                    eng = self.engine()
+                    return eng.remove(data, p, prog, cancel)
+                self.run_job(fn, 'Loading the model and removing stars…' if loading else 'Removing stars…', self.remove_done, 'remove')
+
+            def remove_done(self, st):
+                self.state = st
+                self.applied_sig = None
+                self.stf = stf_params(st.x)
+                self.update_overlays()
+                self.set_msg(f'Stars removed in {self.timings["remove"]:.1f} s. Move Star removal, paint marks, or press Apply in the main window.')
+                want = self.host.panel.auto_keep.isChecked() and bool(self.host.panel.critic_path())
+                if want != st.auto_keep:                        # the box was changed while the network was running
+                    self.set_auto_keep(want)
+                elif has_paint(self.strokes, 'remove'):
+                    self.start_marks()
+                else:
+                    self.start_finish()
+
+            def panel_changed(self):
+                """Main-window Star removal slider moved: update the result from the cache (debounced, latest wins)."""
+                if self.ready():
+                    self.request_finish(120)
+
+            def request_finish(self, ms=0):
+                self.ftimer.start(ms)
+
+            def start_finish(self):
+                if not self.ready():
+                    return
+                if self.busy():
+                    self.finish_dirty = True
+                    return
+                amount = self.host.panel.removal.value() / 100.0
+                st, strokes, shape, flip = self.state, copy.deepcopy(self.strokes), self.shape, self.flip
+                version = self.version
+
+                def fn(prog, cancel):
+                    _, mk = masks_from_strokes(strokes, shape, flip) if has_paint(strokes, 'keep') else (None, None)
+                    eng = self.engine()
+                    out, info = eng.finish(st, amount, mk, 'starless', raw=True)
+                    stars = info['stars']
+                    kdisp = max(float(np.percentile(stars[:, ::2, ::2].mean(0), 99.9)), 1e-6)
+                    return dict(out=out, stars=stars, kdisp=kdisp, version=version, state=st)
+                self.run_job_quiet(fn, self.finish_done, 'finish')
+
+            def run_job_quiet(self, fn, on_done, key):
+                """Like run_job but without the progress bar / messages (instant updates)."""
+                self.job_active = True
+                self.job = Job(fn)
+                self.job.done.connect(lambda res, k=key, f=on_done: self.job_done(res, k, f))
+                self.job.failed.connect(self.job_failed)
+                self.host.set_busy(True)
+                self.host.progress.setRange(0, 0)
+                self.update_controls()
+                self.job.start()
+
+            def finish_done(self, res):
+                if res['version'] == self.version and res['state'] is self.state:
+                    self.res = res
+                self.request_refresh(0)
+
+            def start_marks(self):
+                if self.busy() or not self.ready():
+                    return
+                st, strokes, shape, flip = self.state, copy.deepcopy(self.strokes), self.shape, self.flip
+                sig = strokes_signature(stroke_layers(strokes, 'remove')) if has_paint(strokes, 'remove') else None
+
+                def fn(prog, cancel):
+                    mr, _ = masks_from_strokes(strokes, shape, flip) if has_paint(strokes, 'remove') else (None, None)
+                    return self.engine().remove_marks(st, mr, prog, cancel), sig
+                self.run_job(fn, 'Re-running the network on the Remove marks…', self.marks_done, 'marks')
+
+            def marks_done(self, res):
+                st, sig = res
+                self.state = st
+                self.applied_sig = sig
+                self.set_msg(f'Remove marks applied in {self.timings["marks"]:.1f} s.')
+                self.start_finish()
+
+            def set_auto_keep(self, on):
+                """Main-window Auto-keep box: apply or remove Auto-keep on the cached result (the critic runs once)."""
+                if not self.ready():
+                    return
+                if self.busy():
+                    self.host.panel.sync_auto_keep(self.state.auto_keep)
+                    return
+                if bool(on) == self.state.auto_keep:
+                    return
+                st, cp = self.state, self.host.panel.critic_path()
+
+                def fn(prog, cancel):
+                    return self.engine().set_auto_keep(st, on, cp, prog, cancel)
+                self.run_job(fn, 'Updating Auto-keep…', self.state_changed, 'auto')
+
+            def set_mode(self, mode):
+                if not self.ready() or self.busy() or mode == self.state.mode:
+                    return
+                st = self.state
+
+                def fn(prog, cancel):
+                    return self.engine().set_mode(st, mode, prog, cancel)
+                self.run_job(fn, 'Recomputing the star layer…', self.state_changed, 'mode')
+
+            def state_changed(self, st):
+                self.state = st
+                self.stf = stf_params(st.x)
+                self.update_overlays()
+                self.start_finish()
+
+            def stroke_ended(self):
+                self.update_overlays()
+                self.update_controls()
+                last = self.strokes[-1] if self.strokes else None
+                if last is not None and last['layer'] in ('keep', 'both'):
+                    self.request_finish(10)
+                if self.auto_marks.isChecked() and last is not None and last['layer'] in ('remove', 'both') and self.pending_remove() and not self.busy():
+                    self.start_marks()
+
+            def undo_stroke(self):
+                if self.strokes and not self.busy() and self.view.draft is None:
+                    self.strokes.pop()
+                    self.stroke_ended()
+                    self.request_finish(10)
+
+            def clear_marks(self):
+                if self.strokes and not self.busy():
+                    self.strokes.clear()
+                    self.stroke_ended()
+                    self.request_finish(10)
+
+            # ---- tools / overlay
+            def set_tool(self, tool):
+                for k, b in self.tool_btns.items():
+                    b.setChecked(k == tool)
+                self.view.set_tool(tool)
+
+            def brush_changed(self, v):
+                self.view.brush_size = brush_fraction(v)
+                if self.ready() or self.shape != (1, 1):
+                    self.bval.setText(f'{self.view.brush_size * min(self.shape):.0f} px')
+                self.view.viewport().update()
+
+            def pixmap(self, rgb):
+                h, w, c = rgb.shape
+                return QPixmap.fromImage(QImage(rgb.data, w, h, w * c, QImage.Format.Format_RGB888).copy())
+
+            def update_base(self):
+                pass
+
+            def update_overlays(self, *_):
+                if self.shape == (1, 1):
+                    return
+                H, W = self.shape
+                ps = min(1.0, 2048.0 / max(H, W))
+                pw, ph = max(1, int(round(W * ps))), max(1, int(round(H * ps)))
+                sx, sy = pw / W, ph / H
+                layers = {}
+                for layer, rgb in (('remove', REMOVE_RGB), ('keep', KEEP_RGB)):
+                    img = QImage(pw, ph, QImage.Format.Format_ARGB32_Premultiplied)
+                    img.fill(0)
+                    layers[layer] = (img, rgb)
+                for st in self.strokes:
+                    pts = [self.view.scene_point(p) for p in st['points']]
+                    pts = [QPointF(p.x() * sx, p.y() * sy) for p in pts]
+                    for layer, (img, rgb) in layers.items():
+                        if not st['erase'] and st['layer'] != layer:
+                            continue
+                        pn = QPainter(img)
+                        pn.setRenderHint(QPainter.RenderHint.Antialiasing)
+                        if st['erase']:
+                            pn.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+                        pen = QPen(QColor(*rgb))
+                        pen.setWidthF(max(st['size'] * min(H, W) * min(sx, sy), 1.0))
+                        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                        pn.setPen(pen)
+                        if len(pts) == 1:
+                            pn.drawPoint(pts[0])
+                        else:
+                            path = QPainterPath(pts[0])
+                            for p in pts[1:]:
+                                path.lineTo(p)
+                            pn.drawPath(path)
+                        pn.end()
+                self.view.item.set_overlays([im for im, _ in layers.values()])
+                self.view.item.overlay_visible = self.show_marks.isChecked()
+                self.view.item.update()
+                self.update_controls()
+
+            # ---- original on hold
+            def hold_original(self, on):
+                if self.holding != on:
+                    self.holding = on
+                    self.request_refresh(0)
+
+            def keyPressEvent(self, e):
+                if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
+                    self.hold_original(True)
+                    return
+                super().keyPressEvent(e)
+
+            def keyReleaseEvent(self, e):
+                if e.key() == Qt.Key.Key_Space and not e.isAutoRepeat():
+                    self.hold_original(False)
+                    return
+                super().keyReleaseEvent(e)
+
+            # ---- viewport refresh (latest request wins)
+            def request_refresh(self, ms=60):
+                self.rtimer.start(ms)
+
+            def refresh(self):
+                if not self.ready():
+                    return
+                if self.render_thread is not None and self.render_thread.isRunning():
+                    self.render_dirty = True
+                    return
+                self.render_dirty = False
+                st, res = self.state, self.res
+                rect, scale = self.view.visible_rect(), self.view.device_scale()
+                orig = self.holding or res is None
+                stars = (not orig) and self.stars_btn.isChecked()
+                stf = self.stf if self.stf_box.isChecked() else None
+                shape, flip = self.shape, self.flip
+
+                def fn():
+                    if orig:
+                        src, kind = st.x, 'image'
+                    elif stars:
+                        src, kind = res['stars'], 'stars'
+                    else:
+                        src, kind = res['out'], 'image'
+                    return render_crop(src, shape, rect, scale, flip, kind, st.stretched, stf, res['kdisp'] if res else 1.0)
+                self.render_thread = RenderThread(fn)
+                self.render_thread.done.connect(self.render_done)
+                self.render_thread.failed.connect(lambda m: self.set_msg(m, True))
+                self.render_thread.start()
+
+            def render_done(self, res, secs):
+                if self.render_thread is not None:
+                    self.render_thread.wait()
+                self.last_render_ms = secs * 1000
+                if res is not None:
+                    rgb, (x, y, w, h) = res
+                    b = w // rgb.shape[1] if rgb.shape[1] else 1
+                    self.view.item.set_detail(self.pixmap(rgb), QRectF(x, y, w, h), b == 1)
+                self.update_status()
+                if self.render_dirty:
+                    self.refresh()
+
+            def wait_idle(self, timeout=900):
+                t0 = time.time()
+                while (self.busy() or (self.render_thread is not None and self.render_thread.isRunning()) or self.rtimer.isActive()
+                       or self.ftimer.isActive() or self.finish_dirty) and time.time() - t0 < timeout:
+                    QApplication.processEvents()
+                    time.sleep(0.01)
+                QApplication.processEvents()
+
+            def release(self):
+                """Free the cached arrays (window really closing)."""
+                self.state = self.res = self.data = None
+
+            def closeEvent(self, e):
+                self.hold_original(False)
+                super().closeEvent(e)           # hidden, not destroyed: Apply in the main window can still reuse the cached result and the marks
+
+            def shutdown(self):
+                if self.job is not None and self.job.isRunning():
+                    self.job.cancel()
+                    self.job.wait(8000)
+                if self.render_thread is not None:
+                    self.render_thread.wait(2000)
+                self.release()
+                self.close()
+
+        _EDITOR['cls'] = Editor
+        return Editor
+
+
+    # ----------------------------------------------------------------------------------------------- panel
     class StarlessPanel:
         def __init__(self, ui, layout, host):
+            self.host = host
             self.removal = ui.slider(layout, 'Star removal', 0, 100, 100, lambda v: f'{v}%', REMOVAL_TIP)
+            self.auto_keep = ui.check(layout, 'Auto-keep nebula found in the star layer', AUTO_KEEP_TIP)
             self.data = ui.combo(layout, 'Data', [('Auto', 'auto'), ('Linear', 'linear'), ('Stretched', 'stretched')], DATA_TIP)
             self.out = ui.combo(layout, 'Output', [('Starless image', 'starless'), ('Stars only', 'stars')], OUTPUT_TIP)
             self.save = ui.check(layout, 'Also save the star layer as FITS next to the image', SAVE_TIP)
+            self.ed = None
+            self.removal.valueChanged.connect(lambda v: self.ed is not None and self.ed.panel_changed())
+            self.data.currentIndexChanged.connect(lambda *_: self.ed is not None and self.ed.set_mode(self.data.currentData()))
+            self.auto_keep.toggled.connect(self.auto_keep_toggled)
+
+        # ---- the Auto-keep model (a separate download)
+        def critic_path(self):
+            return extra_path(self.host.spec, CRITIC_KIND)
+
+        def auto_keep_toggled(self, on):
+            if on and not self.critic_path():
+                self.sync_auto_keep(False)
+                self.host.dl_btn.setStyleSheet('background: #1274d5; color: #ffffff; font-weight: bold;')
+                self.host.set_status(CRITIC_MISSING, True)
+                return
+            if self.ed is not None:
+                self.ed.set_auto_keep(bool(on))
+
+        def sync_auto_keep(self, on):
+            self.auto_keep.blockSignals(True)
+            self.auto_keep.setChecked(bool(on))
+            self.auto_keep.blockSignals(False)
+
+        def extras_changed(self):
+            self.host.dl_btn.setStyleSheet('' if self.host.model_path() else 'background: #1274d5; color: #ffffff; font-weight: bold;')
+
+        # ---- editor hooks used by the shared window
+        def open_editor(self, host, data, meta, identity, params, path):
+            if self.ed is None:
+                self.ed = editor_class()(host, host.spec)
+            self.ed.open_image(data, meta, identity, params, path)
+
+        def editor_busy(self):
+            return self.ed is not None and self.ed.busy()
+
+        def cancel(self):
+            if self.ed is not None:
+                self.ed.cancel()
+
+        def shutdown(self):
+            if self.ed is not None:
+                self.ed.shutdown()
 
         def model_changed(self, path):
             pass
 
         def params(self):
-            return {'amount': self.removal.value() / 100.0, 'mode': self.data.currentData(), 'output': self.out.currentData()}
+            cp = self.critic_path() if self.auto_keep.isChecked() else None
+            return {'amount': self.removal.value() / 100.0, 'mode': self.data.currentData(), 'output': self.out.currentData(),
+                    'auto_keep': bool(cp), 'critic_model_path': cp}
 
         def settings(self):
-            return dict(removal=self.removal.value(), data=self.data.currentData(), output=self.out.currentData(), save=self.save.isChecked())
+            return dict(removal=self.removal.value(), data=self.data.currentData(), output=self.out.currentData(), save=self.save.isChecked(),
+                        auto_keep=self.auto_keep.isChecked())
 
         def set_settings(self, d):
             if isinstance(d.get('removal'), int):
@@ -2139,6 +3699,18 @@ def _tool_starless():
                     w.setCurrentIndex(i)
             if isinstance(d.get('save'), bool):
                 self.save.setChecked(d['save'])
+            if isinstance(d.get('auto_keep'), bool):
+                self.sync_auto_keep(d['auto_keep'] and bool(self.critic_path()))
+
+
+    def _mask_arg(path, shape):
+        d, _, _ = read_fits(Path(path))
+        d = np.asarray(d, np.float32)
+        while d.ndim > 2:
+            d = d[0]
+        if d.shape != tuple(shape):
+            raise SystemExit(f'Mask {path} has shape {d.shape}, the image has {tuple(shape)}.')
+        return np.clip(np.nan_to_num(d), 0, 1)
 
 
     class StarlessSpec(ToolSpec):
@@ -2150,19 +3722,70 @@ def _tool_starless():
             ap.add_argument('--data', choices=['auto', 'linear', 'stretched'], default='auto', help='starless: data type (default auto)')
             ap.add_argument('--output', choices=['starless', 'stars'], default='starless', help='starless: write the starless image or the star layer')
             ap.add_argument('--stars-out', help='starless: also write the star layer to this FITS file (must not exist)')
+            ap.add_argument('--auto-keep', action='store_true', help='starless: put non-star structure found in the star layer back (needs the Auto-keep model)')
+            ap.add_argument('--critic-model', help='starless: the Auto-keep model file (default: the installed one)')
+            ap.add_argument('--remove-marks', help='starless: FITS map (0..1, same size, array row order) of Remove marks')
+            ap.add_argument('--keep-marks', help='starless: FITS map (0..1, same size, array row order) of Keep marks')
 
         def check_cli(self, a, ap):
             if not 0 <= a.removal <= 1:
                 ap.error('--removal must lie in [0, 1]')
 
         def params_from_args(self, a):
-            return {'amount': a.removal, 'mode': a.data, 'output': a.output}
+            p = {'amount': a.removal, 'mode': a.data, 'output': a.output}
+            if a.auto_keep:
+                cp = a.critic_model or extra_path(self, CRITIC_KIND)
+                if not cp:
+                    raise SystemExit(CRITIC_MISSING.replace('Press Download model.', 'Run with --download all, or put it in the models folder.'))
+                p.update(auto_keep=True, critic_model_path=cp)
+            for k, f in (('mask_remove', a.remove_marks), ('mask_keep', a.keep_marks)):
+                if f:
+                    p[k + '_file'] = f
+            return p
+
+        def image_params(self, header_text):
+            return {}
 
         def preview_params(self, p):
-            return dict(p, output='starless')       # the preview shows the starless result; the star layer is one click away
+            return dict(p, output='starless')
 
         def label(self, p):
-            return f"removal {float(p.get('amount', 1)):.2f} data {p.get('mode', 'auto')} output {p.get('output', 'starless')}"
+            extra = (' auto-keep' if p.get('auto_keep') else '') + (f" marks {p['marks']}" if p.get('marks') else '')
+            return f"removal {float(p.get('amount', 1)):.2f} data {p.get('mode', 'auto')} output {p.get('output', 'starless')}{extra}"
+
+        # ---- Apply: reuse the editor's cached result and marks when the image and model are the same
+        def prepare_job(self, view, job):
+            ed = view.panel.ed
+            if job['kind'] != 'apply' or ed is None or ed.identity != job['identity'] or not ed.strokes and ed.state is None:
+                return None
+            extra = dict(strokes=copy.deepcopy(ed.strokes), flip=ed.flip, state=ed.state if ed.model_path == view.model_path() else None)
+            nr = len([s for s in stroke_layers(ed.strokes, 'remove') if not s['erase']])
+            nk = len([s for s in stroke_layers(ed.strokes, 'keep') if not s['erase']])
+            if nr or nk:
+                job['params'] = dict(job['params'], marks=f'{nr}R/{nk}K')
+            return extra
+
+        def engine_run(self, eng, data, params, progress, cancel, extra):
+            p = dict(params)
+            shape = tuple(np.asarray(data).shape[-2:])
+            for k in ('mask_remove', 'mask_keep'):               # command line: FITS maps
+                f = p.pop(k + '_file', None)
+                if f:
+                    p[k] = _mask_arg(f, shape)
+            if extra is not None:
+                mr, mk = masks_from_strokes(extra['strokes'], shape, extra['flip'])
+                st = extra['state']
+                if st is not None:
+                    if p['mode'] != st.mode:
+                        st = eng.set_mode(st, p['mode'], progress, cancel)
+                    if bool(p.get('auto_keep')) != st.auto_keep:
+                        st = eng.set_auto_keep(st, bool(p.get('auto_keep')), p.get('critic_model_path'), progress, cancel)
+                    st = eng.remove_marks(st, mr, progress, cancel)
+                    out, info = eng.finish(st, p['amount'], mk, p['output'])
+                    info.pop('state', None)
+                    return out, info
+                p.update(mask_remove=mr, mask_keep=mk)
+            return eng.run(data, p, progress=progress, cancel=cancel)
 
         def post_apply(self, ctx, params, info):
             if not ctx.view.panel.save.isChecked() or info.get('stars') is None:
@@ -2187,7 +3810,8 @@ def _tool_starless():
         prefix='UMBRA_STARLESS_', folder='Umbra Starless',
         labels={'umbra_starless_v1.0': 'Umbra Starless v1.0 (default)', 'umbra_starless_v1.1_experimental': 'Umbra Starless v1.1 (experimental)'},
         default_stems=('umbra_starless_v1.0',),
-        notes=['AI star remover for linear or stretched images.'], linear_only=False, alt=('Show star layer', 'stars'))
+        notes=['AI star remover for linear or stretched images.'], linear_only=False, alt=('Show star layer', 'stars'),
+        extras={CRITIC_KIND: 'umbra_starless_critic'}, has_editor=True)
     return types.SimpleNamespace(**{k: v for k, v in locals().items() if not k.startswith('__')})
 
 

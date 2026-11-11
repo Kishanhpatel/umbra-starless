@@ -9,9 +9,12 @@
       "default": true,
       "format": "onnx",
       "file": "umbra_starless_v1.0.onnx",
-      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.1.0/umbra_starless_v1.0.onnx",
-      "sha256": "599856db4f047960829d85360b420f48f932e1f0c179e107fd19560a88e528b9",
-      "size_bytes": 198671695
+      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.2.0/umbra_starless_v1.0.onnx",
+      "sha256": "a880f3c370f3b241a23d02dda512acc8d11c35e4673685d34e5da4a3aa7429ae",
+      "size_bytes": 99732475,
+      "alt_sha256": [
+        "599856db4f047960829d85360b420f48f932e1f0c179e107fd19560a88e528b9"
+      ]
     },
     {
       "id": "umbra_starless_v1.1_experimental",
@@ -21,13 +24,29 @@
       "default": false,
       "format": "onnx",
       "file": "umbra_starless_v1.1_experimental.onnx",
-      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.1.0/umbra_starless_v1.1_experimental.onnx",
-      "sha256": "73007ac76d96bfddcdfcc47a45385a815fe7dc5d6fd385b431a474ae73930aca",
-      "size_bytes": 198671695
+      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.2.0/umbra_starless_v1.1_experimental.onnx",
+      "sha256": "526159bcc0814f4aa8a4a3d2ea38760531a348a50bb2a9f074391319a155ee76",
+      "size_bytes": 99732475,
+      "alt_sha256": [
+        "73007ac76d96bfddcdfcc47a45385a815fe7dc5d6fd385b431a474ae73930aca"
+      ]
+    },
+    {
+      "id": "umbra_starless_critic_v1.0",
+      "name": "Umbra Starless Auto-keep model v1.0",
+      "version": "1.0",
+      "kind": "critic",
+      "experimental": false,
+      "default": false,
+      "format": "onnx",
+      "file": "umbra_starless_critic_v1.0.onnx",
+      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.2.0/umbra_starless_critic_v1.0.onnx",
+      "sha256": "f90065bab78cf3bbe058d1859fee35a52812d0383b977ac1a08b598b4ed57f36",
+      "size_bytes": 3398415
     }
   ],
   "script": {
-    "version": "0.1.1",
-    "url": "https://github.com/Kishanhpatel/umbra-starless/releases/tag/v0.1.1"
+    "version": "0.2.0",
+    "url": "https://github.com/Kishanhpatel/umbra-starless/releases/tag/v0.2.0"
   }
 }
