@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "id": "umbra_starless_v1.0",
+      "name": "Umbra Starless v1.0",
+      "version": "1.0",
+      "experimental": false,
+      "default": true,
+      "format": "onnx",
+      "file": "umbra_starless_v1.0.onnx",
+      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.1.0/umbra_starless_v1.0.onnx",
+      "sha256": "599856db4f047960829d85360b420f48f932e1f0c179e107fd19560a88e528b9",
+      "size_bytes": 198671695
+    },
+    {
+      "id": "umbra_starless_v1.1_experimental",
+      "name": "Umbra Starless v1.1 (experimental)",
+      "version": "1.1",
+      "experimental": true,
+      "default": false,
+      "format": "onnx",
+      "file": "umbra_starless_v1.1_experimental.onnx",
+      "url": "https://github.com/Kishanhpatel/umbra-starless/releases/download/v0.1.0/umbra_starless_v1.1_experimental.onnx",
+      "sha256": "73007ac76d96bfddcdfcc47a45385a815fe7dc5d6fd385b431a474ae73930aca",
+      "size_bytes": 198671695
+    }
+  ],
+  "script": {
+    "version": "0.1.0",
+    "url": "https://github.com/Kishanhpatel/umbra-starless/releases/tag/v0.1.0"
+  }
+}
