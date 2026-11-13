@@ -8,7 +8,8 @@ Run in Siril (Scripts menu), or standalone:
   python Umbra_Starless.py --image in.fits --out out.fits [--model PATH.onnx] [--removal 0..1] [--data auto|linear|stretched] [--output starless|stars] [--stars-out stars.fits] [--auto-keep] [--remove-marks MAP.fits] [--keep-marks MAP.fits]
   python Umbra_Starless.py --ui-test        (opens the window on a fake image, runs Apply once, exits)
   python Umbra_Starless.py --check-updates | --download [MODEL_ID|all]"""
-VERSION = '0.4.0'
+VERSION = '0.4.1'
+# 0.4.1: no more black or coloured spots where very bright stars were removed (e.g. around Alnitak): the holes are filled to the surrounding sky or nebula level with matching grain.
 # 0.4.0: edits carry over between tools (Denoise, then Deblur starts from the denoised image); Undo / Redo above the image (Cmd/Ctrl+Z); Undo all fixed (back to the opened image, also in Siril); Apply is a small blue button inside the panel; drop-down menus show the whole list; hold Space anywhere to see the original, [ and ] change the brush size; Apply sits under the model list and the Star removal slider and brushes are in a second panel that unlocks after Apply (Star removal always starts at 100%); StarNet++ also works on images smaller than 512 px.
 # 0.3.0: new window like Umbra Guided GHS: fixed controls column, zoomable image on the right that shows the original at once; Apply shows the result there, Apply to Siril writes it, Undo all puts back the starting image; Download sits next to the model list, models not installed are listed as (Not Downloaded), and the update check runs at every start (green / yellow note); Remove / Keep / Eraser brushes with Opacity are painted directly on the image; Show star mask; the star layer is always saved as starmask_<image name>; StarNet++ appears as a model when it is installed; improved clean-up around big star halos; Output, Data and Auto-keep options removed from the window.
 # 0.2.1: Auto-keep runs on the GPU again on the Mac (Core ML; about 6x faster than the CPU).
@@ -3331,6 +3332,62 @@ def _engine_starless():
         return clean_residue_v2(x, S, sigma, k=k, half_size=half_size, dil=dil, resize=_resize_bilinear)
 
 
+    def _bsig(a):
+        b = a[::2, ::2]
+        d = (b - _gblur(b, 4.0))
+        return 1.4826 * float(np.median(np.abs(d - np.median(d))))
+
+    def pit_fill(x, S, sigma, k=4.0, seed=1, info=None):
+        # 2026-11-13 (holes_diag): the net leaves -50..-130 sigma pits at saturated stars; nothing else in the pipeline raises a pixel.
+        """Replace over-subtracted pits (S far below its surrounding background) inside star footprints by background + matched noise.
+        Background = masked normalised blur of the non-pit pixels (3 scales), first estimated from outside the star zone only.  The pit mask is
+        the UNION over channels (one shared mask, so the fill cannot tint); only pixels with x - S > 2 sigma (a removed star was there)."""
+        from scipy import ndimage
+        C, H, W = S.shape
+        rem = _gblur((x - S).mean(0), 1.0) > 3.0 * sigma
+        zone = ndimage.binary_dilation(rem, iterations=10)
+        Sm = _gblur(S.mean(0), 4.0)
+        protect = ndimage.binary_dilation(Sm > np.median(Sm) + 500.0 * sigma, iterations=6)     # galaxy nuclei / very bright cores: never touched
+        zone &= ~protect
+        if not zone.any():
+            return S
+        rng = np.random.default_rng(seed)
+        g = np.stack([_gblur(S[c], 1.0) for c in range(C)]); gx = _gblur(x, 1.0)
+        sc = [max(_bsig(S[c]), 0.5 * sigma) for c in range(C)]
+        valid = (~zone).astype(np.float32) if (~zone).sum() > 2000 else np.ones((H, W), np.float32)
+        pit = np.zeros((H, W), bool)
+        for it in range(5):
+            bg = np.zeros_like(S); pc = np.zeros((H, W), bool)
+            den = [_gblur(valid, s_) for s_ in (10.0, 30.0, 90.0)]
+            for c in range(C):
+                bgs = [_gblur(g[c] * valid, s_) / np.maximum(d_, 1e-6) for s_, d_ in zip((10.0, 30.0, 90.0), den)]
+                b = np.where(den[1] > 0.04, bgs[1], bgs[2]); b = np.where(den[0] > 0.08, bgs[0], b)
+                bg[c] = b
+                pc |= (g[c] < b - k * sc[c]) & ((gx[c] - g[c]) > 2.0 * sc[c])
+            pit = zone & pc
+            if pit.any():
+                pit = ndimage.binary_opening(pit, structure=np.ones((2, 2)))
+            valid = (~ndimage.binary_dilation(pit, iterations=3)).astype(np.float32)
+        if not pit.any():
+            return S
+        area = ndimage.binary_dilation(pit, iterations=2)
+        w = np.clip(_gblur(area.astype(np.float32), 1.5) * 1.5, 0, 1) * zone
+        out = S.copy()
+        vv = valid * (~area).astype(np.float32)
+        dv = _gblur(vv, 24.0)
+        nz0 = rng.standard_normal((C, H, W)).astype(np.float32)
+        for c in range(C):
+            hp = S[c] - _gblur(S[c], 1.0)
+            loc = np.sqrt(np.maximum(_gblur(hp * hp * vv, 24.0) / np.maximum(dv, 1e-3), 0)) * 1.75
+            loc = np.where(dv > 0.02, loc, sc[c])
+            nz = _gblur(nz0[c], 0.6); nz /= max(float(nz.std()), 1e-6)
+            fill = bg[c] + loc * nz * 0.6
+            out[c] = np.minimum(S[c] * (1 - w) + np.maximum(fill, S[c]) * w, x[c])
+        if info is not None:
+            info.append(int(pit.sum()))
+        return out.astype(np.float32)
+
+
     def noise_fill(x, S, sigma, seed=0):
         S = clean_residue(x, S, sigma)
         rem = (x - S).mean(0)
@@ -3352,7 +3409,8 @@ def _engine_starless():
         if rho > 0.05:
             sb = math.sqrt(-1 / (4 * math.log(min(max(rho, 0.06), 0.95))))
             nz = _gblur(nz, sb); nz /= max(float(nz.std()), 1e-6)
-        return np.minimum(S + reg[None] * add * nz, x).astype(np.float32)
+        S = np.minimum(S + reg[None] * add * nz, x).astype(np.float32)
+        return pit_fill(x, S, sigma)          # fill dark pits back to the local background (only raises, never above x)
 
 
     # ------------------------------------------------------------------------------------------------ star layer and Reduce Stars

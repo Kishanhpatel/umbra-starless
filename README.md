@@ -82,7 +82,7 @@ Models are published as GitHub release assets and are not stored in this reposit
 
 ## Weaknesses
 
-- Very bright stars (for example Alnitak, or the stars in NGC 2264 and the Wizard Nebula) can leave glows or starburst artefacts.
+- Very bright stars (for example Alnitak, or the stars in NGC 2264 and the Wizard Nebula) can leave glows or faint spike rays. Since v0.4.1 the black or coloured spots they used to leave are filled to the surrounding level.
 - Bright nebula and galaxy cores can be partly taken for stars. The core of the Orion Nebula (M42) is still partly cut and leaves a messy patch.
 - Compact knots in galaxies (M82, spiral-arm knots in M33) and thin filaments (Veil, Crescent) can partly go into the star layer.
 - The command-line `--auto-keep` option is conservative: on many images it puts back little or nothing, and it can miss structure. It is not in the window; use the Keep brush instead.
@@ -110,6 +110,7 @@ Tested:
 - macOS 26 on an Apple M3, with Core ML and with the CPU.
 - Standalone (command line and window test) and inside Siril 1.4.5 run headless (`siril-cli` with `pyscript`): read the image, process it, write it back with an Undo state, save.
 - The window was tested offscreen only. The brushes in the main window were tested offscreen with synthetic mouse strokes.
+- v0.4.1: the hole filling around very bright stars was checked on 40 test images (no image got worse on any of our star-removal measures; clear gains on Rho Ophiuchi, IC 434 and the Taurus widefield).
 - v0.4.0: the shared history (Apply, Undo, Redo, Apply to Siril, Undo all), the brushes (including Clone) and the Space / [ ] keys were tested offscreen with a stand-in for Siril and synthetic mouse drags, not yet in the Siril window itself.
 
 NOT tested:
