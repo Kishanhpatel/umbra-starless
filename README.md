@@ -37,15 +37,15 @@ The star layer is always saved when you press **Apply to Siril**, as `starmask_<
 The star layer is the input minus the starless result for linear data, and recombines with it by screen blending for stretched data. Starless plus stars gives back the input (to float rounding).
 
 
-**The window.** The window has a fixed-width controls column on the left and a large image area on the right. The image area shows the current image (auto-stretched) as soon as the window opens. Scroll or pinch to zoom and drag to pan. Double-click the image or press **Fit** to fit the whole image. Hold down **Show original** (or the Space key) to compare with the original; release it to see the result again. The window keeps its size when you switch tools or models.
+**The window.** The window has a fixed-width controls column on the left and a large image area on the right. The image area shows the current image (auto-stretched) as soon as the window opens. Scroll or pinch to zoom and drag to pan. Double-click the image or press **Fit** to fit the whole image. Hold down **Show original**, or hold the Space key anywhere in the window, to compare with the image before the tool; release it to see the result again. **Undo** and **Redo** at the top left of the image area step back and forward through your Apply results (Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z); the last 10 steps are kept. The window keeps its size when you switch tools or models.
 
-**Star removal and correction marks.** The star removal itself is computed once per image and model (the network is the slow part). After that, the marks and the **Star removal** slider update quickly. Moving **Star removal** updates the result from the stored result.
+**Star removal and correction marks.** **Apply** sits right under the model list. The **Star removal** slider and the brushes are in a second panel below it, greyed out until **Apply** has made the star mask; then the slider brings stars back or removes them right away. Star removal starts at 100% each time. The star removal itself is computed once per image and model (the network is the slow part). After that, the marks and the **Star removal** slider update quickly. Moving **Star removal** updates the result from the stored result.
 
 **Correction marks** are painted directly on the image in the main window. Click a brush to paint with it, and click it again to go back to pan and zoom. Right-click erases. The middle mouse button pans.
 - **Remove**: paint where stars or residue were wrongly kept.
 - **Keep**: paint where something was wrongly removed (a galaxy or nebula knot). The original comes back there.
 - **Eraser**: erases marks.
-- **Brush size** (1 to 100, default 30).
+- **Brush size** (1 to 100, default 30; keys **[** and **]** make it smaller and bigger).
 - **Opacity** (5 to 100%): the strength of each stroke.
 - **Show marks**: shows or hides the overlay.
 - **Clear marks**: removes all marks.
@@ -54,7 +54,7 @@ After each stroke the result updates by itself. Marks are drawn on the picture a
 
 **StarNet++.** If the StarNet2 command-line program is installed (found through Siril's StarNet setting or the usual install locations), the model list also shows "StarNet++ vX (installed)", and the script uses it for star removal. Marks, **Star removal** and **Show star mask** still work. If it is not installed, no StarNet entry appears. StarNet++ is not included or distributed with Umbra: install it yourself. Older StarNet++ versions that only take TIFF files on the command line are not supported.
 
-**Apply and Apply to Siril.** **Apply** runs the tool on the whole image and shows the result in the image area. The image in Siril is not changed. **Apply to Siril** writes the result to the image in Siril. Use Siril's **Undo** to go back. If nothing changed since **Apply**, the result shown is reused. **Undo all** (bottom row, between **Close** and **Apply to Siril**) puts back the image as it was when the window opened. It becomes active after an **Apply to Siril**. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
+**Apply and Apply to Siril.** **Apply** (the small blue button inside the tool's panel) runs the tool on the whole image and shows the result in the image area. The image in Siril is not changed. **Apply to Siril** writes the current result to the image in Siril as one step, so Siril's **Undo** goes back. If you changed the settings since **Apply**, it runs the tool first. Until then the image in Siril is not changed, whatever you do in the window. **Undo all** (bottom row, between **Close** and **Apply to Siril**) goes back to the image as it was when the window opened, and also puts it back in Siril if you had written anything; **Redo** can still bring the steps back. Siril's scripting interface cannot write a FITS HISTORY line, so the settings used are written to the Siril log (and into any extra FITS file the tool saves).
 
 **Command line.** `python Umbra_Starless.py --image IN.fits --out OUT.fits` runs the tool without a window. Flags: `--removal 0..1`, `--data auto|linear|stretched`, `--output starless|stars`, `--stars-out FILE`, `--auto-keep` (with `--critic-model PATH`, default: the installed one), `--remove-marks MAP.fits` and `--keep-marks MAP.fits` (maps from 0 to 1, same size as the image, rows as stored in the file), `--model PATH`. `--data`, `--output` and `--auto-keep` are no longer in the window. `--check-updates` and `--download [MODEL_ID|all]` work from the command line too, and `--help` lists everything.
 
@@ -110,6 +110,7 @@ Tested:
 - macOS 26 on an Apple M3, with Core ML and with the CPU.
 - Standalone (command line and window test) and inside Siril 1.4.5 run headless (`siril-cli` with `pyscript`): read the image, process it, write it back with an Undo state, save.
 - The window was tested offscreen only. The brushes in the main window were tested offscreen with synthetic mouse strokes.
+- v0.4.0: the shared history (Apply, Undo, Redo, Apply to Siril, Undo all), the brushes (including Clone) and the Space / [ ] keys were tested offscreen with a stand-in for Siril and synthetic mouse drags, not yet in the Siril window itself.
 
 NOT tested:
 - Windows and Linux.
@@ -117,7 +118,7 @@ NOT tested:
 - Intel Macs.
 - The interactive window inside the Siril GUI, and painting with a real mouse or pen.
 - Very large frames with marks (memory use is several times the image size).
-- StarNet++ inside the Siril window (it was tested from the command line with StarNet2 v2.6.2 on macOS: star removal, star layer and exact recombination).
+- StarNet++ inside the Siril window (it was tested from the command line with StarNet2 v2.6.2 on macOS: star removal, star layer and exact recombination; images smaller than 512 px are padded for StarNet and cropped back).
 
 Correction marks and Auto-keep were compared with the original PyTorch version on three 1024 px crops with synthetic marks: Remove and Keep marks, Auto-keep and their combination differ by at most about 2 noise sigma at a single pixel (the same threshold outlier as without marks) and by about 0.02 sigma rms or less; the Auto-keep map differs by 2e-7. The Auto-keep model flagged only 0.05 to 0.2 percent of those crops. Remove marks use a local noise fill like the original script.
 
